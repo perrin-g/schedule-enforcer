@@ -1,9 +1,5 @@
 <Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
-    <TargetFramework>net9.0</TargetFramework>
-    <RollForward>LatestMajor</RollForward>
-    <Nullable>enable</Nullable>
-    <ImplicitUsings>enable</ImplicitUsings>
     <AssemblyName>Jellyfin.Plugin.ScheduleEnforcer</AssemblyName>
     <RootNamespace>Jellyfin.Plugin.ScheduleEnforcer</RootNamespace>
   </PropertyGroup>
