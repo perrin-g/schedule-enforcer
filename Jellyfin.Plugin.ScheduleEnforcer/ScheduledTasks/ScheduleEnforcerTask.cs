@@ -279,7 +279,7 @@ public class ScheduleEnforcerTask : IScheduledTask
             // non-controllable session playing nothing is not worth waking an admin for.
             if (_state.TryMarkNotified(userId, deviceId, windowEndUtc, nowUtc))
             {
-                _notifier.Notify($"Session {session.Id} for user {userId} does not support media control; tokens revoked, but Stop could not be sent.");
+                await _notifier.NotifyAsync($"Session {session.Id} for user {userId} does not support media control; tokens revoked, but Stop could not be sent.").ConfigureAwait(false);
             }
 
             return;
@@ -300,7 +300,7 @@ public class ScheduleEnforcerTask : IScheduledTask
         if (retryCount >= NotifyAfterConsecutiveRetries &&
             _state.TryMarkNotified(userId, deviceId, windowEndUtc, nowUtc))
         {
-            _notifier.Notify($"Session {session.Id} for user {userId} has not stopped after {retryCount} consecutive attempts.");
+            await _notifier.NotifyAsync($"Session {session.Id} for user {userId} has not stopped after {retryCount} consecutive attempts.").ConfigureAwait(false);
         }
     }
 

@@ -19,6 +19,8 @@ public class ServiceRegistrator : IPluginServiceRegistrator
         // Fault isolation's StartupTrigger mitigation).
         serviceCollection.AddSingleton<ISessionEnforcementState, SessionEnforcementState>();
 
+        // LoggingNotifier's IActivityManager dependency needs no registration of its own -- it is a
+        // core Jellyfin service already in the host container, and constructor injection picks it up.
         serviceCollection.AddSingleton<INotifier, LoggingNotifier>();
 
         // ScheduleEnforcerTask itself is deliberately NOT registered here. Jellyfin discovers
