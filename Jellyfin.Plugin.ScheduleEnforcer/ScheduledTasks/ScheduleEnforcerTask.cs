@@ -248,7 +248,7 @@ public class ScheduleEnforcerTask : IScheduledTask
         var revoked = await TryRunCommandAsync(ct => _sessionManager.RevokeUserTokens(userId, null).WaitAsync(ct), taskToken).ConfigureAwait(false);
         if (!revoked)
         {
-            _logger.LogWarning("ScheduleEnforcer: token revoke for user {UserId} timed out", userId);
+            _logger.LogWarning("ScheduleEnforcer: token revoke for user {UserId} did not complete", userId);
         }
 
         // Everything BELOW this point is gated on the session actually still playing something.
@@ -290,7 +290,7 @@ public class ScheduleEnforcerTask : IScheduledTask
             taskToken).ConfigureAwait(false);
         if (!stopped)
         {
-            _logger.LogWarning("ScheduleEnforcer: stop command for session {SessionId} timed out", session.Id);
+            _logger.LogWarning("ScheduleEnforcer: stop command for session {SessionId} did not complete", session.Id);
         }
 
         var previous = _stillLiveRetryCounts.TryGetValue(retryKey, out var existing) ? existing.Count : 0;
@@ -319,18 +319,28 @@ public class ScheduleEnforcerTask : IScheduledTask
             taskToken).ConfigureAwait(false);
         if (!sent)
         {
-            _logger.LogWarning("ScheduleEnforcer: message send to session {SessionId} timed out", session.Id);
+            _logger.LogWarning("ScheduleEnforcer: message send to session {SessionId} did not complete", session.Id);
         }
     }
 
-    // Runs one Jellyfin call under its own per-command timeout. Returns false if that timeout
-    // fired, true if the call completed.
+    // Runs one Jellyfin call under its own per-command timeout. Returns true if the call
+    // completed, false if it did NOT complete for any reason -- timed out, or threw.
     //
-    // The exception filter MUST test `taskToken`, never the linked `cts.Token`: the linked token
-    // is by definition already cancelled whenever the timeout fires, so filtering on it would
-    // never match, rethrow on every timeout, and skip all the retry/notify accounting downstream.
-    // (That was a real bug in an earlier draft; ExecuteAsync_StopCommandTimesOut_... is its
-    // regression test.) A genuine cancellation of the whole task still propagates.
+    // Catching every exception here (not just OperationCanceledException) is what actually makes
+    // the three commands in FinalizeAndStopAsync independent, as their comments claim. With a
+    // narrower catch, a non-cancellation throw out of RevokeUserTokens (a DB error, say) escaped
+    // to the per-session catch in ExecuteAsync and skipped that tick's Stop attempt entirely; and
+    // because the final message is sent BEFORE the revoke -- with TryMarkFinalized already
+    // flipped -- a throw from SendMessageCommand lost that message forever AND preempted the
+    // revoke. Both are covered by ExecuteAsync_*ThrowsNonCancellationException_* regression tests.
+    //
+    // The one rethrow case is a genuine cancellation of the whole scheduled task. That filter MUST
+    // test `taskToken`, never the linked `cts.Token`: the linked token is by definition already
+    // cancelled whenever the per-command timeout fires, so filtering on it would match on every
+    // timeout, rethrow, and skip all the retry/notify accounting downstream. (That was a real bug
+    // in an earlier draft; ExecuteAsync_StopCommandTimesOut_... is its regression test.) An
+    // OperationCanceledException that is NOT driven by task cancellation is just another failure
+    // and falls through to the general catch below.
     private async Task<bool> TryRunCommandAsync(Func<CancellationToken, Task> command, CancellationToken taskToken)
     {
         using var cts = CancellationTokenSource.CreateLinkedTokenSource(taskToken);
@@ -341,8 +351,13 @@ public class ScheduleEnforcerTask : IScheduledTask
             await command(cts.Token).ConfigureAwait(false);
             return true;
         }
-        catch (OperationCanceledException) when (!taskToken.IsCancellationRequested)
+        catch (OperationCanceledException) when (taskToken.IsCancellationRequested)
         {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "ScheduleEnforcer: command did not complete");
             return false;
         }
     }

@@ -413,6 +413,103 @@ public class ScheduleEnforcerTaskTests
     }
 
     [Fact]
+    public async Task ExecuteAsync_RevokeThrowsNonCancellationException_StopCommandIsStillAttempted()
+    {
+        // Regression test for the final review's finding #1: TryRunCommandAsync originally caught
+        // only OperationCanceledException, so any OTHER failure (a DB error out of
+        // RevokeUserTokens, say) propagated all the way to the per-session catch in ExecuteAsync
+        // and skipped that tick's Stop attempt entirely. The three commands are documented as
+        // independent, and that has to hold for every failure mode, not just the timeout one.
+        var sessionManager = new Mock<ISessionManager>();
+        var userManager = new Mock<IUserManager>();
+        var notifier = new Mock<INotifier>();
+        var realState = new SessionEnforcementState();
+
+        var user = CreateUser(isAdministrator: false, new AccessSchedule(DynamicDayOfWeek.Everyday, 13.0, 17.0, Guid.NewGuid()));
+        var session = CreateControllableSession(user.Id, "device-1");
+        sessionManager.Setup(m => m.Sessions).Returns(new List<SessionInfo> { session });
+        userManager.Setup(m => m.GetUserById(user.Id)).Returns(user);
+        var windowCalculator = WindowEndingAt(DateTimeOffset.UtcNow.AddMinutes(-1));
+
+        sessionManager
+            .Setup(m => m.RevokeUserTokens(It.IsAny<Guid>(), It.IsAny<string>()))
+            .Throws(new InvalidOperationException("simulated database failure"));
+
+        var task = new ScheduleEnforcerTask(sessionManager.Object, userManager.Object, windowCalculator.Object, realState, notifier.Object, Auckland, () => DefaultConfig(), Mock.Of<Microsoft.Extensions.Logging.ILogger<ScheduleEnforcerTask>>());
+
+        await task.ExecuteAsync(new Progress<double>(), CancellationToken.None);
+
+        // The failing revoke must not preempt the Stop attempt on the same tick.
+        sessionManager.Verify(m => m.RevokeUserTokens(user.Id, null), Times.Once);
+        sessionManager.Verify(
+            m => m.SendPlaystateCommand(It.IsAny<string>(), session.Id, It.Is<PlaystateRequest>(r => r.Command == PlaystateCommand.Stop), It.IsAny<CancellationToken>()),
+            Times.Once);
+    }
+
+    [Fact]
+    public async Task ExecuteAsync_FinalMessageThrowsNonCancellationException_RevokeAndStopStillRun()
+    {
+        // Companion to the test above for the other half of finding #1: the final message is sent
+        // BEFORE the revoke, and TryMarkFinalized has already flipped by then. A non-cancellation
+        // throw out of SendMessageCommand used to both lose that message forever AND preempt the
+        // revoke and the Stop for that tick.
+        var sessionManager = new Mock<ISessionManager>();
+        var userManager = new Mock<IUserManager>();
+        var notifier = new Mock<INotifier>();
+        var realState = new SessionEnforcementState();
+
+        var user = CreateUser(isAdministrator: false, new AccessSchedule(DynamicDayOfWeek.Everyday, 13.0, 17.0, Guid.NewGuid()));
+        var session = CreateControllableSession(user.Id, "device-1");
+        sessionManager.Setup(m => m.Sessions).Returns(new List<SessionInfo> { session });
+        userManager.Setup(m => m.GetUserById(user.Id)).Returns(user);
+        var windowCalculator = WindowEndingAt(DateTimeOffset.UtcNow.AddMinutes(-1));
+
+        sessionManager
+            .Setup(m => m.SendMessageCommand(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<MessageCommand>(), It.IsAny<CancellationToken>()))
+            .Throws(new InvalidOperationException("simulated transport failure"));
+
+        var task = new ScheduleEnforcerTask(sessionManager.Object, userManager.Object, windowCalculator.Object, realState, notifier.Object, Auckland, () => DefaultConfig(), Mock.Of<Microsoft.Extensions.Logging.ILogger<ScheduleEnforcerTask>>());
+
+        await task.ExecuteAsync(new Progress<double>(), CancellationToken.None);
+
+        sessionManager.Verify(m => m.RevokeUserTokens(user.Id, null), Times.Once);
+        sessionManager.Verify(
+            m => m.SendPlaystateCommand(It.IsAny<string>(), session.Id, It.Is<PlaystateRequest>(r => r.Command == PlaystateCommand.Stop), It.IsAny<CancellationToken>()),
+            Times.Once);
+    }
+
+    [Fact]
+    public async Task ExecuteAsync_CancelledMidCommand_StillPropagatesCancellation()
+    {
+        // The widened catch must not swallow a genuine task cancellation: when the OUTER task
+        // token is what was cancelled, TryRunCommandAsync still rethrows and ExecuteAsync's own
+        // filter lets it out.
+        var sessionManager = new Mock<ISessionManager>();
+        var userManager = new Mock<IUserManager>();
+        var notifier = new Mock<INotifier>();
+        var realState = new SessionEnforcementState();
+
+        var user = CreateUser(isAdministrator: false, new AccessSchedule(DynamicDayOfWeek.Everyday, 13.0, 17.0, Guid.NewGuid()));
+        var session = CreateControllableSession(user.Id, "device-1");
+        sessionManager.Setup(m => m.Sessions).Returns(new List<SessionInfo> { session });
+        userManager.Setup(m => m.GetUserById(user.Id)).Returns(user);
+        var windowCalculator = WindowEndingAt(DateTimeOffset.UtcNow.AddMinutes(-1));
+
+        using var cts = new CancellationTokenSource();
+        sessionManager
+            .Setup(m => m.SendMessageCommand(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<MessageCommand>(), It.IsAny<CancellationToken>()))
+            .Returns((string _, string _, MessageCommand _, CancellationToken ct) =>
+            {
+                cts.Cancel();
+                return Task.Delay(Timeout.Infinite, ct);
+            });
+
+        var task = new ScheduleEnforcerTask(sessionManager.Object, userManager.Object, windowCalculator.Object, realState, notifier.Object, Auckland, () => DefaultConfig(), Mock.Of<Microsoft.Extensions.Logging.ILogger<ScheduleEnforcerTask>>());
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => task.ExecuteAsync(new Progress<double>(), cts.Token));
+    }
+
+    [Fact]
     public async Task ExecuteAsync_WhenDisabled_DoesNotEvenEnumerateSessions()
     {
         var sessionManager = new Mock<ISessionManager>();
