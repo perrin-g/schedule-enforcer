@@ -269,7 +269,7 @@ public class ScheduleEnforcerTaskTests
         await task.ExecuteAsync(new Progress<double>(), CancellationToken.None);
         await task.ExecuteAsync(new Progress<double>(), CancellationToken.None);
 
-        notifier.Verify(n => n.Notify(It.Is<string>(s => s.Contains("does not support media control", StringComparison.Ordinal))), Times.Once);
+        notifier.Verify(n => n.NotifyAsync(It.Is<string>(s => s.Contains("does not support media control", StringComparison.Ordinal))), Times.Once);
         sessionManager.Verify(m => m.SendPlaystateCommand(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<PlaystateRequest>(), It.IsAny<CancellationToken>()), Times.Never);
 
         // Revocation is a SERVER-side action and must NOT be gated on the client's media-control
@@ -315,7 +315,7 @@ public class ScheduleEnforcerTaskTests
             await task.ExecuteAsync(new Progress<double>(), CancellationToken.None);
         }
 
-        notifier.Verify(n => n.Notify(It.Is<string>(s => s.Contains("has not stopped after 3 consecutive attempts", StringComparison.Ordinal))), Times.Once);
+        notifier.Verify(n => n.NotifyAsync(It.Is<string>(s => s.Contains("has not stopped after 3 consecutive attempts", StringComparison.Ordinal))), Times.Once);
 
         // The revoke must NOT be sequenced behind the Stop command's success. An earlier structure
         // awaited Stop and the revoke inside one try block, so a hanging Stop jumped to the catch
@@ -353,7 +353,7 @@ public class ScheduleEnforcerTaskTests
         await task.ExecuteAsync(new Progress<double>(), CancellationToken.None);
         await task.ExecuteAsync(new Progress<double>(), CancellationToken.None);
 
-        notifier.Verify(n => n.Notify(It.IsAny<string>()), Times.Never);
+        notifier.Verify(n => n.NotifyAsync(It.IsAny<string>()), Times.Never);
 
         // Stop is play-state-gated, so it is only sent on the tick where something was playing...
         sessionManager.Verify(m => m.SendPlaystateCommand(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<PlaystateRequest>(), It.IsAny<CancellationToken>()), Times.Once);
@@ -409,7 +409,7 @@ public class ScheduleEnforcerTaskTests
         // ...while the play-state-dependent actions correctly stay gated: Stop was only sent on
         // the tick where something was actually playing, and no false alert was raised.
         sessionManager.Verify(m => m.SendPlaystateCommand(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<PlaystateRequest>(), It.IsAny<CancellationToken>()), Times.Once);
-        notifier.Verify(n => n.Notify(It.IsAny<string>()), Times.Never);
+        notifier.Verify(n => n.NotifyAsync(It.IsAny<string>()), Times.Never);
     }
 
     [Fact]
