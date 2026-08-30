@@ -354,8 +354,62 @@ public class ScheduleEnforcerTaskTests
         await task.ExecuteAsync(new Progress<double>(), CancellationToken.None);
 
         notifier.Verify(n => n.Notify(It.IsAny<string>()), Times.Never);
-        sessionManager.Verify(m => m.RevokeUserTokens(It.IsAny<Guid>(), It.IsAny<string>()), Times.Once);
+
+        // Stop is play-state-gated, so it is only sent on the tick where something was playing...
         sessionManager.Verify(m => m.SendPlaystateCommand(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<PlaystateRequest>(), It.IsAny<CancellationToken>()), Times.Once);
+
+        // ...but the revoke is not gated on play state and is retried on every tick past cutoff,
+        // so that a revoke which failed transiently is never left un-retried just because the
+        // client stopped reporting a NowPlayingItem. See
+        // ExecuteAsync_RevokeFailsThenPlaybackPauses_RevokeIsStillRetried.
+        sessionManager.Verify(m => m.RevokeUserTokens(user.Id, null), Times.Exactly(3));
+    }
+
+    [Fact]
+    public async Task ExecuteAsync_RevokeFailsThenPlaybackPauses_RevokeIsStillRetried()
+    {
+        // Regression test for the "pause to dodge a failed revoke" hole: several clients null out
+        // NowPlayingItem while merely PAUSED, not stopped. If the revoke retry sat behind the
+        // stillPlaying gate, a revoke that failed transiently on one tick would never be retried
+        // once the user paused -- and un-pausing later would resume playback on tokens that were
+        // never actually revoked. Revocation is server-side, so it must retry every tick past
+        // cutoff regardless of what the client reports about play state.
+        var sessionManager = new Mock<ISessionManager>();
+        var userManager = new Mock<IUserManager>();
+        var notifier = new Mock<INotifier>();
+        var realState = new SessionEnforcementState();
+
+        var user = CreateUser(isAdministrator: false, new AccessSchedule(DynamicDayOfWeek.Everyday, 13.0, 17.0, Guid.NewGuid()));
+        var session = CreateControllableSession(user.Id, "device-1");
+        sessionManager.Setup(m => m.Sessions).Returns(new List<SessionInfo> { session });
+        userManager.Setup(m => m.GetUserById(user.Id)).Returns(user);
+        var windowCalculator = WindowEndingAt(DateTimeOffset.UtcNow.AddMinutes(-1));
+
+        // A revoke that never completes -- the transient server-side failure this retries for.
+        // RevokeUserTokens takes no CancellationToken, so the task is bounded by WaitAsync.
+        sessionManager
+            .Setup(m => m.RevokeUserTokens(It.IsAny<Guid>(), It.IsAny<string>()))
+            .Returns(() => Task.Delay(Timeout.InfiniteTimeSpan));
+
+        var task = new ScheduleEnforcerTask(
+            sessionManager.Object, userManager.Object, windowCalculator.Object, realState, notifier.Object, Auckland,
+            () => DefaultConfig(), Mock.Of<Microsoft.Extensions.Logging.ILogger<ScheduleEnforcerTask>>(),
+            commandTimeout: TimeSpan.FromMilliseconds(50));
+
+        // Tick 1: playing, revoke attempted and times out.
+        await task.ExecuteAsync(new Progress<double>(), CancellationToken.None);
+
+        // User pauses; the client nulls out NowPlayingItem. Tokens are still live at this point.
+        session.NowPlayingItem = null;
+        await task.ExecuteAsync(new Progress<double>(), CancellationToken.None);
+
+        // The revoke must have been retried on the paused tick, not skipped.
+        sessionManager.Verify(m => m.RevokeUserTokens(user.Id, null), Times.Exactly(2));
+
+        // ...while the play-state-dependent actions correctly stay gated: Stop was only sent on
+        // the tick where something was actually playing, and no false alert was raised.
+        sessionManager.Verify(m => m.SendPlaystateCommand(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<PlaystateRequest>(), It.IsAny<CancellationToken>()), Times.Once);
+        notifier.Verify(n => n.Notify(It.IsAny<string>()), Times.Never);
     }
 
     [Fact]

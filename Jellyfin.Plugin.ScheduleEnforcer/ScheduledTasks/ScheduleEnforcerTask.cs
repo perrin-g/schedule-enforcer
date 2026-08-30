@@ -214,36 +214,34 @@ public class ScheduleEnforcerTask : IScheduledTask
     {
         var nowUtc = DateTimeOffset.UtcNow;
         var retryKey = (userId, deviceId, windowEndUtc);
-        var isFirstFinalization = _state.TryMarkFinalized(userId, deviceId, windowEndUtc, nowUtc);
-
-        if (isFirstFinalization)
+        if (_state.TryMarkFinalized(userId, deviceId, windowEndUtc, nowUtc))
         {
             await SendMessageSafeAsync(session, config.FinalMessageTemplate, taskToken).ConfigureAwait(false);
         }
 
-        // "Still listed in ISessionManager.Sessions" is NOT evidence that enforcement failed --
-        // Jellyfin keeps a SessionInfo around for a while after playback ends, so a correctly
-        // enforced cutoff would otherwise raise a false "enforcement is failing" alert three
-        // ticks later and train the admin to ignore the one alert that matters. NowPlayingItem
-        // clearing is the real success signal (spec: retry-notify trigger). The first
-        // finalization tick always proceeds regardless, so an idle-but-still-authenticated
-        // session still gets its tokens revoked -- that is the resume loophole this closes.
-        var stillPlaying = session.NowPlayingItem is not null;
-        if (!isFirstFinalization && !stillPlaying)
-        {
-            _stillLiveRetryCounts.TryRemove(retryKey, out _);
-            return;
-        }
-
-        // Unconditional, and sequenced independently of the Stop command below. Revocation is a
-        // server-side action that does not depend on the client supporting media control, and it
-        // is THE enforcement mechanism that must still work when Stop cannot reach the client at
-        // all -- Stop alone only clears NowPlayingItem, leaving the client authenticated and free
-        // to resume seconds later (spec: Core loop step 7). Earlier drafts had it nested after
-        // SendPlaystateCommand inside a shared try, which made it unreachable whenever Stop timed
-        // out, and behind the SupportsMediaControl gate, which made it unreachable for
-        // non-controllable clients -- i.e. unreachable in exactly the two failure modes it exists
-        // to cover.
+        // Attempted on EVERY tick past cutoff, before any play-state gate, independently of the
+        // Stop command below, and regardless of whether the client supports media control.
+        // Revocation is a server-side action whose success does not depend on anything the client
+        // reports, and it is THE enforcement mechanism that must still work when Stop cannot reach
+        // the client at all -- Stop alone only clears NowPlayingItem, leaving the client
+        // authenticated and free to resume seconds later (spec: Core loop step 7).
+        //
+        // Three separate gates have had to be removed from in front of this call, all of which
+        // made it unreachable in precisely the failure modes it exists to cover:
+        //   1. below the SupportsMediaControl early return -- unreachable for non-controllable
+        //      clients;
+        //   2. nested after SendPlaystateCommand inside a shared try -- unreachable whenever Stop
+        //      timed out;
+        //   3. below the !stillPlaying early return -- a transient revoke failure on a tick where
+        //      the client happened to be paused (several clients null out NowPlayingItem while
+        //      paused) would never be retried, so un-pausing later resumed playback on tokens
+        //      that were never actually revoked.
+        //
+        // Revokes ALL of this user's tokens (not just this device) -- deliberately broad: a
+        // scheduled user having another live device at cutoff is itself worth ending, and
+        // SessionInfo exposes no access-token property that would allow a narrower per-device
+        // revoke without an extra IDeviceManager lookup. Forcing a fresh login means the next
+        // attempt to resume is blocked by Jellyfin's own native Access Schedule outside the window.
         //
         // Revokes ALL of this user's tokens (not just this device) -- deliberately broad: a
         // scheduled user having another live device at cutoff is itself worth ending, and
@@ -259,6 +257,20 @@ public class ScheduleEnforcerTask : IScheduledTask
             _logger.LogWarning("ScheduleEnforcer: token revoke for user {UserId} timed out", userId);
         }
 
+        // Everything BELOW this point is gated on the session actually still playing something.
+        // "Still listed in ISessionManager.Sessions" is NOT evidence that enforcement failed --
+        // Jellyfin keeps a SessionInfo around for a while after playback ends, so counting those
+        // ticks would raise a false "enforcement is failing" alert for a cutoff that worked and
+        // train the admin to ignore the one alert that matters. Sending Stop to a session that
+        // isn't playing anything is likewise meaningless. The revoke above is deliberately NOT
+        // part of this gate.
+        var stillPlaying = session.NowPlayingItem is not null;
+        if (!stillPlaying)
+        {
+            _stillLiveRetryCounts.TryRemove(retryKey, out _);
+            return;
+        }
+
         // SupportsMediaControl is the only capability signal Jellyfin actually exposes for this
         // -- SupportedCommands is a GeneralCommandType list, and GeneralCommandType has no Stop
         // member at all (Stop is a PlaystateCommand, a different enum). Confirmed via reflection
@@ -268,10 +280,10 @@ public class ScheduleEnforcerTask : IScheduledTask
             // Mutually exclusive with the retry-count notify below by construction: this branch
             // always returns, so a given (userId, deviceId, windowEndUtc) key can only ever reach
             // one of the two TryMarkNotified call sites, never both -- sharing the same notified
-            // flag between them is therefore safe, not a collision risk. Only alerts while media
-            // is actually still playing: tokens are revoked either way, so a non-controllable
-            // session that isn't playing anything is not a failure worth waking an admin for.
-            if (stillPlaying && _state.TryMarkNotified(userId, deviceId, windowEndUtc, nowUtc))
+            // flag between them is therefore safe, not a collision risk. Only reached while media
+            // is actually still playing (guarded above): tokens are revoked either way, so a
+            // non-controllable session playing nothing is not worth waking an admin for.
+            if (_state.TryMarkNotified(userId, deviceId, windowEndUtc, nowUtc))
             {
                 _notifier.Notify($"Session {session.Id} for user {userId} does not support media control; tokens revoked, but Stop could not be sent.");
             }
@@ -285,12 +297,6 @@ public class ScheduleEnforcerTask : IScheduledTask
         if (!stopped)
         {
             _logger.LogWarning("ScheduleEnforcer: stop command for session {SessionId} timed out", session.Id);
-        }
-
-        if (!stillPlaying)
-        {
-            // Nothing was playing, so there is no "failed to stop" condition to start counting.
-            return;
         }
 
         var previous = _stillLiveRetryCounts.TryGetValue(retryKey, out var existing) ? existing.Count : 0;
