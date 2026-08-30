@@ -11,6 +11,7 @@ using Jellyfin.Plugin.ScheduleEnforcer.ScheduledTasks;
 using Jellyfin.Plugin.ScheduleEnforcer.Services;
 using MediaBrowser.Controller.Library;
 using MediaBrowser.Controller.Session;
+using MediaBrowser.Model.Dto;
 using MediaBrowser.Model.Session;
 using Moq;
 using Xunit;
@@ -46,7 +47,11 @@ public class ScheduleEnforcerTaskTests
         {
             Id = sessionId,
             UserId = userId,
-            DeviceId = deviceId
+            DeviceId = deviceId,
+            // Actively playing by default: enforcement treats a cleared NowPlayingItem as
+            // "successfully enforced" and stops retrying, so a session that is meant to be
+            // enforced in these tests must actually be playing something.
+            NowPlayingItem = new BaseItemDto { Name = "Test Item" }
         };
         return session;
     }
@@ -244,7 +249,7 @@ public class ScheduleEnforcerTaskTests
     }
 
     [Fact]
-    public async Task ExecuteAsync_SessionWithoutMediaControl_NotifiesOnceAndNeverStops()
+    public async Task ExecuteAsync_SessionWithoutMediaControl_RevokesTokensButNeverSendsStopCommand()
     {
         var sessionManager = new Mock<ISessionManager>();
         var userManager = new Mock<IUserManager>();
@@ -266,7 +271,12 @@ public class ScheduleEnforcerTaskTests
 
         notifier.Verify(n => n.Notify(It.Is<string>(s => s.Contains("does not support media control", StringComparison.Ordinal))), Times.Once);
         sessionManager.Verify(m => m.SendPlaystateCommand(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<PlaystateRequest>(), It.IsAny<CancellationToken>()), Times.Never);
-        sessionManager.Verify(m => m.RevokeUserTokens(It.IsAny<Guid>(), It.IsAny<string>()), Times.Never);
+
+        // Revocation is a SERVER-side action and must NOT be gated on the client's media-control
+        // capability -- otherwise a client Jellyfin cannot remote-control simply keeps streaming
+        // past the cutoff with a valid token. This assertion previously read Times.Never, which
+        // encoded exactly the hole the enforcement design exists to close.
+        sessionManager.Verify(m => m.RevokeUserTokens(user.Id, null), Times.AtLeastOnce);
     }
 
     [Fact]
@@ -306,6 +316,46 @@ public class ScheduleEnforcerTaskTests
         }
 
         notifier.Verify(n => n.Notify(It.Is<string>(s => s.Contains("has not stopped after 3 consecutive attempts", StringComparison.Ordinal))), Times.Once);
+
+        // The revoke must NOT be sequenced behind the Stop command's success. An earlier structure
+        // awaited Stop and the revoke inside one try block, so a hanging Stop jumped to the catch
+        // and the revoke never ran -- leaving the session both un-stopped AND still authenticated,
+        // which is the precise failure mode token revocation was added to cover.
+        sessionManager.Verify(m => m.RevokeUserTokens(user.Id, null), Times.Exactly(3));
+    }
+
+    [Fact]
+    public async Task ExecuteAsync_NowPlayingItemClears_StopsRetryingAndRaisesNoFalseAlert()
+    {
+        // A stopped session commonly lingers in ISessionManager.Sessions past its idle timeout
+        // before Jellyfin garbage-collects it. Counting those ticks as "still live" would raise
+        // an "enforcement is failing" alert for a cutoff that actually worked, training the admin
+        // to ignore the one alert that matters. NowPlayingItem clearing is the real success signal.
+        var sessionManager = new Mock<ISessionManager>();
+        var userManager = new Mock<IUserManager>();
+        var notifier = new Mock<INotifier>();
+        var realState = new SessionEnforcementState();
+
+        var user = CreateUser(isAdministrator: false, new AccessSchedule(DynamicDayOfWeek.Everyday, 13.0, 17.0, Guid.NewGuid()));
+        var session = CreateControllableSession(user.Id, "device-1");
+        sessionManager.Setup(m => m.Sessions).Returns(new List<SessionInfo> { session });
+        userManager.Setup(m => m.GetUserById(user.Id)).Returns(user);
+        var windowCalculator = WindowEndingAt(DateTimeOffset.UtcNow.AddMinutes(-1));
+
+        var task = new ScheduleEnforcerTask(sessionManager.Object, userManager.Object, windowCalculator.Object, realState, notifier.Object, Auckland, () => DefaultConfig(), Mock.Of<Microsoft.Extensions.Logging.ILogger<ScheduleEnforcerTask>>());
+
+        // Tick 1: playing, so enforcement runs.
+        await task.ExecuteAsync(new Progress<double>(), CancellationToken.None);
+
+        // Playback stopped, but the session object is still listed -- exactly the lingering-session
+        // case. Ticks 2 and 3 must treat this as enforced, not as two more failed attempts.
+        session.NowPlayingItem = null;
+        await task.ExecuteAsync(new Progress<double>(), CancellationToken.None);
+        await task.ExecuteAsync(new Progress<double>(), CancellationToken.None);
+
+        notifier.Verify(n => n.Notify(It.IsAny<string>()), Times.Never);
+        sessionManager.Verify(m => m.RevokeUserTokens(It.IsAny<Guid>(), It.IsAny<string>()), Times.Once);
+        sessionManager.Verify(m => m.SendPlaystateCommand(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<PlaystateRequest>(), It.IsAny<CancellationToken>()), Times.Once);
     }
 
     [Fact]

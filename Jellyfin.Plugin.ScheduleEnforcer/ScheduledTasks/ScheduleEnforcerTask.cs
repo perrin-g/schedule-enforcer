@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
+using System.Globalization;
 using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
@@ -39,7 +40,7 @@ public class ScheduleEnforcerTask : IScheduledTask
     private readonly ILogger<ScheduleEnforcerTask> _logger;
     private readonly TimeSpan _commandTimeout;
 
-    // Tracks consecutive still-live ticks after finalization, keyed the same way as
+    // Tracks consecutive still-playing ticks after finalization, keyed the same way as
     // ISessionEnforcementState (user, device, window end) -- not just (user, device) -- so a
     // stale count from a previous day's window can never leak into a new window's first tick
     // and trigger a false "3 retries" notification immediately. Concurrent because Jellyfin's
@@ -58,7 +59,7 @@ public class ScheduleEnforcerTask : IScheduledTask
         ILogger<ScheduleEnforcerTask> logger,
         // Optional (trailing, defaulted) so every production/DI call site and the plan's test
         // call sites are unchanged; tests override it to drive the command-timeout path without
-        // a real five-second wait.
+        // a real five-second wait. Applied per command, not as one shared budget for the tick.
         TimeSpan? commandTimeout = null)
     {
         _sessionManager = sessionManager;
@@ -78,7 +79,11 @@ public class ScheduleEnforcerTask : IScheduledTask
 
     public string Description => "Warns and stops active sessions when a user's Access Schedule window ends.";
 
-    public string Category => "Library";
+    // Its own category rather than "Library": this is a session/user-policy job, and Jellyfin's
+    // Scheduled Tasks UI groups purely by this free-form string, so a plugin-specific heading is
+    // both accurate and easy for an admin to find. None of Jellyfin's built-in categories
+    // ("Library", "Maintenance", "Application", "Live TV") describe session enforcement.
+    public string Category => "Schedule Enforcer";
 
     public IEnumerable<TaskTriggerInfo> GetDefaultTriggers()
     {
@@ -158,18 +163,11 @@ public class ScheduleEnforcerTask : IScheduledTask
         var deviceId = session.DeviceId ?? string.Empty;
         var result = _windowCalculator.GetCurrentWindow(schedules.ToList(), nowUtc, _timeZone);
 
-        // Per-command timeout, linked to the task's own cancellation. `cancellationToken` (the
-        // outer token) is passed alongside cts.Token so the OperationCanceledException filters
-        // downstream can tell "our 5s timeout fired" from "the whole task was cancelled" -- they
-        // cannot distinguish those by inspecting the linked token, which is cancelled in both cases.
-        using var cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-        cts.CancelAfter(_commandTimeout);
-
         if (!result.HasCoveringWindow)
         {
             // No window covers "now" while the session is live -- treat as immediate-stop, not
             // a no-op (spec: Core loop step 5). Uses the stable sentinel key, not "nowUtc".
-            await FinalizeAndStopAsync(session, user.Id, deviceId, NoWindowSentinel, config, cts.Token, cancellationToken).ConfigureAwait(false);
+            await FinalizeAndStopAsync(session, user.Id, deviceId, NoWindowSentinel, config, cancellationToken).ConfigureAwait(false);
             return;
         }
 
@@ -187,7 +185,7 @@ public class ScheduleEnforcerTask : IScheduledTask
 
         if (nowUtc >= windowEndUtc)
         {
-            await FinalizeAndStopAsync(session, user.Id, deviceId, windowEndUtc, config, cts.Token, cancellationToken).ConfigureAwait(false);
+            await FinalizeAndStopAsync(session, user.Id, deviceId, windowEndUtc, config, cancellationToken).ConfigureAwait(false);
             return;
         }
 
@@ -195,8 +193,11 @@ public class ScheduleEnforcerTask : IScheduledTask
         if (minutesLeft <= config.WarningMinutesBeforeEnd &&
             _state.TryMarkWarned(user.Id, deviceId, windowEndUtc, nowUtc))
         {
-            var message = config.WarningMessageTemplate.Replace("{minutes}", ((int)Math.Ceiling(minutesLeft)).ToString(System.Globalization.CultureInfo.InvariantCulture), StringComparison.Ordinal);
-            await SendMessageSafeAsync(session, message, cts.Token, cancellationToken).ConfigureAwait(false);
+            var message = config.WarningMessageTemplate.Replace(
+                "{minutes}",
+                ((int)Math.Ceiling(minutesLeft)).ToString(CultureInfo.InvariantCulture),
+                StringComparison.Ordinal);
+            await SendMessageSafeAsync(session, message, cancellationToken).ConfigureAwait(false);
         }
     }
 
@@ -209,15 +210,53 @@ public class ScheduleEnforcerTask : IScheduledTask
         string deviceId,
         DateTimeOffset windowEndUtc,
         PluginConfiguration config,
-        CancellationToken commandToken,
         CancellationToken taskToken)
     {
         var nowUtc = DateTimeOffset.UtcNow;
         var retryKey = (userId, deviceId, windowEndUtc);
+        var isFirstFinalization = _state.TryMarkFinalized(userId, deviceId, windowEndUtc, nowUtc);
 
-        if (_state.TryMarkFinalized(userId, deviceId, windowEndUtc, nowUtc))
+        if (isFirstFinalization)
         {
-            await SendMessageSafeAsync(session, config.FinalMessageTemplate, commandToken, taskToken).ConfigureAwait(false);
+            await SendMessageSafeAsync(session, config.FinalMessageTemplate, taskToken).ConfigureAwait(false);
+        }
+
+        // "Still listed in ISessionManager.Sessions" is NOT evidence that enforcement failed --
+        // Jellyfin keeps a SessionInfo around for a while after playback ends, so a correctly
+        // enforced cutoff would otherwise raise a false "enforcement is failing" alert three
+        // ticks later and train the admin to ignore the one alert that matters. NowPlayingItem
+        // clearing is the real success signal (spec: retry-notify trigger). The first
+        // finalization tick always proceeds regardless, so an idle-but-still-authenticated
+        // session still gets its tokens revoked -- that is the resume loophole this closes.
+        var stillPlaying = session.NowPlayingItem is not null;
+        if (!isFirstFinalization && !stillPlaying)
+        {
+            _stillLiveRetryCounts.TryRemove(retryKey, out _);
+            return;
+        }
+
+        // Unconditional, and sequenced independently of the Stop command below. Revocation is a
+        // server-side action that does not depend on the client supporting media control, and it
+        // is THE enforcement mechanism that must still work when Stop cannot reach the client at
+        // all -- Stop alone only clears NowPlayingItem, leaving the client authenticated and free
+        // to resume seconds later (spec: Core loop step 7). Earlier drafts had it nested after
+        // SendPlaystateCommand inside a shared try, which made it unreachable whenever Stop timed
+        // out, and behind the SupportsMediaControl gate, which made it unreachable for
+        // non-controllable clients -- i.e. unreachable in exactly the two failure modes it exists
+        // to cover.
+        //
+        // Revokes ALL of this user's tokens (not just this device) -- deliberately broad: a
+        // scheduled user having another live device at cutoff is itself worth ending, and
+        // SessionInfo exposes no access-token property that would allow a narrower per-device
+        // revoke without an extra IDeviceManager lookup. Forcing a fresh login means the next
+        // attempt to resume is blocked by Jellyfin's own native Access Schedule outside the window.
+        //
+        // RevokeUserTokens(Guid, string) takes no CancellationToken (confirmed by reflection
+        // against 10.11.11), so WaitAsync bounds it with the same per-command timeout as the rest.
+        var revoked = await TryRunCommandAsync(ct => _sessionManager.RevokeUserTokens(userId, null).WaitAsync(ct), taskToken).ConfigureAwait(false);
+        if (!revoked)
+        {
+            _logger.LogWarning("ScheduleEnforcer: token revoke for user {UserId} timed out", userId);
         }
 
         // SupportsMediaControl is the only capability signal Jellyfin actually exposes for this
@@ -229,36 +268,29 @@ public class ScheduleEnforcerTask : IScheduledTask
             // Mutually exclusive with the retry-count notify below by construction: this branch
             // always returns, so a given (userId, deviceId, windowEndUtc) key can only ever reach
             // one of the two TryMarkNotified call sites, never both -- sharing the same notified
-            // flag between them is therefore safe, not a collision risk.
-            if (_state.TryMarkNotified(userId, deviceId, windowEndUtc, nowUtc))
+            // flag between them is therefore safe, not a collision risk. Only alerts while media
+            // is actually still playing: tokens are revoked either way, so a non-controllable
+            // session that isn't playing anything is not a failure worth waking an admin for.
+            if (stillPlaying && _state.TryMarkNotified(userId, deviceId, windowEndUtc, nowUtc))
             {
-                _notifier.Notify($"Session {session.Id} for user {userId} does not support media control; cannot enforce cutoff.");
+                _notifier.Notify($"Session {session.Id} for user {userId} does not support media control; tokens revoked, but Stop could not be sent.");
             }
 
             return;
         }
 
-        try
+        var stopped = await TryRunCommandAsync(
+            ct => _sessionManager.SendPlaystateCommand(string.Empty, session.Id, new PlaystateRequest { Command = PlaystateCommand.Stop }, ct),
+            taskToken).ConfigureAwait(false);
+        if (!stopped)
         {
-            await _sessionManager.SendPlaystateCommand(string.Empty, session.Id, new PlaystateRequest { Command = PlaystateCommand.Stop }, commandToken).ConfigureAwait(false);
-
-            // Revokes ALL of this user's tokens (not just this device) -- deliberately broad:
-            // a scheduled user having another live device at cutoff is itself worth ending, and
-            // SessionInfo exposes no access-token property that would allow a narrower per-device
-            // revoke without an extra IDeviceManager lookup. Forcing a fresh login means the next
-            // attempt to resume is itself blocked by Jellyfin's own native Access Schedule outside
-            // the window -- this closes the "just press Play again" loophole (spec: Core loop
-            // step 7).
-            await _sessionManager.RevokeUserTokens(userId, null).ConfigureAwait(false);
+            _logger.LogWarning("ScheduleEnforcer: stop command for session {SessionId} timed out", session.Id);
         }
-        catch (OperationCanceledException) when (!taskToken.IsCancellationRequested)
+
+        if (!stillPlaying)
         {
-            // The per-command timeout fired, not the outer task cancellation -- treat as a
-            // failed-to-stop retry below, don't rethrow. NOTE: this filter must test the outer
-            // task token, never `commandToken`: commandToken is the linked+timeout token and is
-            // therefore *always* cancelled when this fires, so filtering on it would rethrow on
-            // every timeout and skip the retry accounting entirely.
-            _logger.LogWarning("ScheduleEnforcer: stop/revoke for session {SessionId} timed out", session.Id);
+            // Nothing was playing, so there is no "failed to stop" condition to start counting.
+            return;
         }
 
         var previous = _stillLiveRetryCounts.TryGetValue(retryKey, out var existing) ? existing.Count : 0;
@@ -280,21 +312,38 @@ public class ScheduleEnforcerTask : IScheduledTask
         }
     }
 
-    private async Task SendMessageSafeAsync(SessionInfo session, string message, CancellationToken commandToken, CancellationToken taskToken)
+    private async Task SendMessageSafeAsync(SessionInfo session, string message, CancellationToken taskToken)
     {
+        var sent = await TryRunCommandAsync(
+            ct => _sessionManager.SendMessageCommand(string.Empty, session.Id, new MessageCommand { Header = "Schedule Enforcer", Text = message }, ct),
+            taskToken).ConfigureAwait(false);
+        if (!sent)
+        {
+            _logger.LogWarning("ScheduleEnforcer: message send to session {SessionId} timed out", session.Id);
+        }
+    }
+
+    // Runs one Jellyfin call under its own per-command timeout. Returns false if that timeout
+    // fired, true if the call completed.
+    //
+    // The exception filter MUST test `taskToken`, never the linked `cts.Token`: the linked token
+    // is by definition already cancelled whenever the timeout fires, so filtering on it would
+    // never match, rethrow on every timeout, and skip all the retry/notify accounting downstream.
+    // (That was a real bug in an earlier draft; ExecuteAsync_StopCommandTimesOut_... is its
+    // regression test.) A genuine cancellation of the whole task still propagates.
+    private async Task<bool> TryRunCommandAsync(Func<CancellationToken, Task> command, CancellationToken taskToken)
+    {
+        using var cts = CancellationTokenSource.CreateLinkedTokenSource(taskToken);
+        cts.CancelAfter(_commandTimeout);
+
         try
         {
-            await _sessionManager.SendMessageCommand(
-                string.Empty,
-                session.Id,
-                new MessageCommand { Header = "Schedule Enforcer", Text = message },
-                commandToken).ConfigureAwait(false);
+            await command(cts.Token).ConfigureAwait(false);
+            return true;
         }
         catch (OperationCanceledException) when (!taskToken.IsCancellationRequested)
         {
-            // See the note in FinalizeAndStopAsync: the filter must test the outer task token,
-            // not the linked command token.
-            _logger.LogWarning("ScheduleEnforcer: message send to session {SessionId} timed out", session.Id);
+            return false;
         }
     }
 }
