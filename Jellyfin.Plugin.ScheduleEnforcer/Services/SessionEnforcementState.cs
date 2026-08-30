@@ -35,9 +35,12 @@ public class SessionEnforcementState : ISessionEnforcementState
     {
         foreach (var kvp in _entries.ToList())
         {
-            if (kvp.Value.LastSeenUtc < cutoffUtc)
+            lock (kvp.Value.Lock)
             {
-                _entries.TryRemove(kvp.Key, out _);
+                if (kvp.Value.LastSeenUtc < cutoffUtc)
+                {
+                    _entries.TryRemove(kvp.Key, out _);
+                }
             }
         }
     }
