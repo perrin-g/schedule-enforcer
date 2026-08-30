@@ -4,9 +4,18 @@
     "description": "Enforces per-user access schedules by proactively kicking sessions outside allowed hours.",
     "guid": "5c90bb47-9d60-4b70-9265-3f2d025fcdd8",
     "imageUrl": "",
-    "name": "ScheduleEnforcer",
+    "name": "Schedule Enforcer",
     "overview": "Actively enforces Jellyfin access schedules instead of only gating new logins.",
     "owner": "perrin-g",
-    "versions": []
+    "versions": [
+      {
+        "version": "0.1.0.0",
+        "targetAbi": "10.11.0.0",
+        "changelog": "Initial release.",
+        "timestamp": "2026-08-30T04:01:27Z",
+        "sourceUrl": "",
+        "checksum": ""
+      }
+    ]
   }
 ]
