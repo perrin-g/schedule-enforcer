@@ -5,7 +5,7 @@
 #
 # Everything else that references the version (deploy commands, the Enable API call) reads
 # it back out of meta.json at execution time via jq rather than hardcoding a literal string --
-# see README.md's Package and deploy section.
+# see README.md's "Build, test, deploy" and "Cutting a release" sections.
 set -euo pipefail
 
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
