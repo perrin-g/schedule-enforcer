@@ -1,1 +1,71 @@
-<!-- placeholder: real config page UI added in a later task -->
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Schedule Enforcer</title>
+</head>
+<body>
+  <div id="ScheduleEnforcerConfigPage" data-role="page" class="page type-interior pluginConfigurationPage" data-require="emby-input,emby-button,emby-checkbox">
+    <div data-role="content">
+      <div class="content-primary">
+        <form id="ScheduleEnforcerConfigForm">
+          <div class="checkboxContainer checkboxContainer-withDescription">
+            <label>
+              <input id="Enabled" name="Enabled" type="checkbox" is="emby-checkbox" />
+              <span>Enabled</span>
+            </label>
+            <div class="fieldDescription checkboxFieldDescription">Warn and stop active sessions when a user's Access Schedule window ends.</div>
+          </div>
+          <div class="inputContainer">
+            <label class="inputLabel inputLabelUnfocused" for="WarningMinutesBeforeEnd">Warning minutes before end</label>
+            <input id="WarningMinutesBeforeEnd" name="WarningMinutesBeforeEnd" type="number" is="emby-input" min="1" />
+          </div>
+          <div class="inputContainer">
+            <label class="inputLabel inputLabelUnfocused" for="WarningMessageTemplate">Warning message ({minutes} is replaced)</label>
+            <input id="WarningMessageTemplate" name="WarningMessageTemplate" type="text" is="emby-input" />
+          </div>
+          <div class="inputContainer">
+            <label class="inputLabel inputLabelUnfocused" for="FinalMessageTemplate">Final message</label>
+            <input id="FinalMessageTemplate" name="FinalMessageTemplate" type="text" is="emby-input" />
+          </div>
+          <button is="emby-button" type="submit" class="raised button-submit block emby-button">
+            <span>Save</span>
+          </button>
+        </form>
+      </div>
+    </div>
+    <script type="text/javascript">
+      (function () {
+        var pluginId = "5c90bb47-9d60-4b70-9265-3f2d025fcdd8";
+
+        document.querySelector('#ScheduleEnforcerConfigPage')
+          .addEventListener('pageshow', function () {
+            Dashboard.showLoadingMsg();
+            ApiClient.getPluginConfiguration(pluginId).then(function (config) {
+              document.querySelector('#Enabled').checked = config.Enabled;
+              document.querySelector('#WarningMinutesBeforeEnd').value = config.WarningMinutesBeforeEnd;
+              document.querySelector('#WarningMessageTemplate').value = config.WarningMessageTemplate;
+              document.querySelector('#FinalMessageTemplate').value = config.FinalMessageTemplate;
+              Dashboard.hideLoadingMsg();
+            });
+          });
+
+        document.querySelector('#ScheduleEnforcerConfigForm')
+          .addEventListener('submit', function (e) {
+            Dashboard.showLoadingMsg();
+            ApiClient.getPluginConfiguration(pluginId).then(function (config) {
+              config.Enabled = document.querySelector('#Enabled').checked;
+              config.WarningMinutesBeforeEnd = parseInt(document.querySelector('#WarningMinutesBeforeEnd').value, 10);
+              config.WarningMessageTemplate = document.querySelector('#WarningMessageTemplate').value;
+              config.FinalMessageTemplate = document.querySelector('#FinalMessageTemplate').value;
+              ApiClient.updatePluginConfiguration(pluginId, config).then(function (result) {
+                Dashboard.processPluginConfigurationUpdateResult(result);
+              });
+            });
+            e.preventDefault();
+            return false;
+          });
+      })();
+    </script>
+  </div>
+</body>
+</html>
