@@ -75,9 +75,14 @@ public class ScheduleWindowCalculator : IScheduleWindowCalculator
 
         if (timeZone.IsAmbiguousTime(local))
         {
+            // Compute the actual UTC instant for each candidate offset and take the earlier one
+            // directly -- deliberately not "pick the smaller/larger offset", which inverts depending
+            // on the sign convention (UTC = local - offset, so the SMALLER offset yields the LATER
+            // UTC instant, not the earlier one). An earlier version picked
+            // offsets.OrderBy(o => o).First() intending "earliest UTC instant" and got exactly this
+            // backwards -- caught during Task 3's task review.
             var offsets = timeZone.GetAmbiguousTimeOffsets(local);
-            var earliestOffset = offsets.OrderBy(o => o).First();
-            return new DateTimeOffset(local, earliestOffset).ToUniversalTime();
+            return offsets.Select(o => new DateTimeOffset(local, o).ToUniversalTime()).Min();
         }
 
         var offset = timeZone.GetUtcOffset(local);

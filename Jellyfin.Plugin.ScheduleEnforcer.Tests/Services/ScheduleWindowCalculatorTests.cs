@@ -127,4 +127,32 @@ public class ScheduleWindowCalculatorTests
 
         Assert.Null(exception);
     }
+
+    [Fact]
+    public void GetCurrentWindow_DstFallBackAmbiguity_ResolvesToEarlierUtcInstant()
+    {
+        // Search forward for NZ's fall-back ambiguous hour rather than hardcoding the calendar
+        // date, to avoid repeating the exact "manually computed the wrong instant" mistake this
+        // test exists to catch.
+        var probe = new DateTime(2026, 1, 1);
+        while (!Auckland.IsAmbiguousTime(probe))
+        {
+            probe = probe.AddMinutes(30);
+        }
+
+        var offsets = Auckland.GetAmbiguousTimeOffsets(probe);
+        var expectedEarliestUtc = offsets.Select(o => new DateTimeOffset(probe, o).ToUniversalTime()).Min();
+
+        // Build a schedule whose window END lands exactly on the ambiguous local instant, then
+        // assert GetCurrentWindow resolves it to expectedEarliestUtc, not the later instant.
+        var dayOfWeek = (DynamicDayOfWeek)(int)probe.DayOfWeek;
+        var endHour = probe.Hour + probe.Minute / 60.0;
+        var schedules = new List<AccessSchedule> { Schedule(dayOfWeek, endHour - 1.0, endHour) };
+        var nowUtc = expectedEarliestUtc.AddMinutes(-30); // inside the window, shortly before its end
+
+        var result = _calculator.GetCurrentWindow(schedules, nowUtc, Auckland);
+
+        Assert.True(result.HasCoveringWindow);
+        Assert.Equal(expectedEarliestUtc, result.WindowEndUtc);
+    }
 }
