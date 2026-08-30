@@ -13,8 +13,8 @@
         "targetAbi": "10.11.0.0",
         "changelog": "Initial release.",
         "timestamp": "2026-08-30T04:01:27Z",
-        "sourceUrl": "",
-        "checksum": ""
+        "sourceUrl": "https://github.com/perrin-g/schedule-enforcer/releases/download/v0.1.0/ScheduleEnforcer_0.1.0.0.zip",
+        "checksum": "732f494f32d819656f826afa35091b0d"
       }
     ]
   }

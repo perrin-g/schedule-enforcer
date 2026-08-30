@@ -28,23 +28,43 @@ several of the source comments cite specific confirmed signatures. Keep doing it
 
 ## Package and deploy
 
-The plugin version lives in three places that must agree: `<Version>` in
-`Jellyfin.Plugin.ScheduleEnforcer.csproj`, `meta.json` / `manifest.json`, and the
-`ScheduleEnforcer_<version>` directory name on the server. Currently `0.1.0.0`.
+`<Version>` in `Jellyfin.Plugin.ScheduleEnforcer.csproj` is the single source of truth for the
+plugin version. After bumping it, run `scripts/sync-version.sh` to propagate it into `meta.json`
+and `manifest.json` — don't hand-edit the version into those two files. The deploy commands below
+read the version back out of `meta.json` via `jq` rather than hardcoding it, so they stay correct
+as long as the sync script has been run.
 
 ```bash
+./scripts/sync-version.sh
 dotnet build -c Release Jellyfin.Plugin.ScheduleEnforcer/Jellyfin.Plugin.ScheduleEnforcer.csproj
 
-ssh <user>@<jellyfin-host> "mkdir -p <jellyfin-plugins-dir>/ScheduleEnforcer_0.1.0.0"
+VERSION=$(jq -r .version meta.json)
+ssh <user>@<jellyfin-host> "mkdir -p <jellyfin-plugins-dir>/ScheduleEnforcer_${VERSION}"
 scp Jellyfin.Plugin.ScheduleEnforcer/bin/Release/net9.0/Jellyfin.Plugin.ScheduleEnforcer.dll \
     meta.json \
-    <user>@<jellyfin-host>:<jellyfin-plugins-dir>/ScheduleEnforcer_0.1.0.0/
+    <user>@<jellyfin-host>:<jellyfin-plugins-dir>/ScheduleEnforcer_${VERSION}/
 ssh <user>@<jellyfin-host> "docker restart jellyfin"
 ```
 
 Only the plugin's own DLL is copied — everything else it references ships with Jellyfin. The
 `meta.json` is required: Jellyfin's plugin discovery is metadata-driven, not "any DLL in a folder".
 It is committed here precisely so deploys stop generating one ad hoc.
+
+To cut a new GitHub release (needed for `manifest.json`'s `sourceUrl`/`checksum` to stay real):
+
+```bash
+./scripts/sync-version.sh
+dotnet publish -c Release Jellyfin.Plugin.ScheduleEnforcer/Jellyfin.Plugin.ScheduleEnforcer.csproj -o dist/ScheduleEnforcer
+VERSION=$(jq -r .version meta.json)
+zip -j "dist/ScheduleEnforcer_${VERSION}.zip" dist/ScheduleEnforcer/Jellyfin.Plugin.ScheduleEnforcer.dll
+CHECKSUM=$(md5sum "dist/ScheduleEnforcer_${VERSION}.zip" | cut -d' ' -f1)
+git tag "v${VERSION%.0}"  # trailing .0 build number dropped for the tag, matching arr-delete-sync's convention
+git push origin "v${VERSION%.0}"
+gh release create "v${VERSION%.0}" "dist/ScheduleEnforcer_${VERSION}.zip" --title "v${VERSION%.0}" --notes "..."
+jq --arg url "https://github.com/perrin-g/schedule-enforcer/releases/download/v${VERSION%.0}/ScheduleEnforcer_${VERSION}.zip" \
+   --arg sum "$CHECKSUM" \
+   '.[0].versions[0].sourceUrl = $url | .[0].versions[0].checksum = $sum' manifest.json > manifest.json.tmp && mv manifest.json.tmp manifest.json
+```
 
 Sanity checks after a restart:
 
@@ -56,10 +76,11 @@ Expect a plugin-loaded line and `ScheduleEnforcer: resolved container timezone i
 If that reads `UTC`, stop — every cutoff will fire against the wrong clock; fix the container's
 timezone first.
 
-`manifest.json` is a plugin-*repository* manifest and is not currently used: `sourceUrl` and
-`checksum` are deliberately empty because there is no hosted artifact. If this is ever published
-through a real Jellyfin plugin repository, both must be filled in with the actual zip URL and its
-checksum.
+`manifest.json` is a plugin-*repository* manifest, pointing at the actual GitHub release —
+`sourceUrl`/`checksum` are real and verified (the published zip's checksum matches what's in this
+file). It isn't wired up as a Jellyfin repository URL anywhere yet (deploy is still manual
+scp above), but it's no longer a placeholder either — see the release-cutting commands above for
+keeping it in sync with future versions.
 
 ## Operational gotcha: a disabled plugin stays disabled
 
@@ -77,7 +98,8 @@ Skipping disabled plugin ... of Schedule Enforcer
 Recovery is an explicit re-enable, via Dashboard → Plugins, or:
 
 ```bash
-ssh <user>@<jellyfin-host> 'API_KEY=$(sqlite3 -readonly <jellyfin-db-path> "SELECT AccessToken FROM ApiKeys WHERE Name=\"<an-existing-key-name>\"") && curl -s -X POST "http://localhost:8096/Plugins/5c90bb47-9d60-4b70-9265-3f2d025fcdd8/0.1.0.0/Enable" -H "X-Emby-Token: $API_KEY"'
+VERSION=$(jq -r .version meta.json)
+ssh <user>@<jellyfin-host> "API_KEY=\$(sqlite3 -readonly <jellyfin-db-path> 'SELECT AccessToken FROM ApiKeys WHERE Name=\"<an-existing-key-name>\"') && curl -s -X POST 'http://localhost:8096/Plugins/5c90bb47-9d60-4b70-9265-3f2d025fcdd8/${VERSION}/Enable' -H \"X-Emby-Token: \$API_KEY\""
 ssh <user>@<jellyfin-host> "docker restart jellyfin"
 ```
 
