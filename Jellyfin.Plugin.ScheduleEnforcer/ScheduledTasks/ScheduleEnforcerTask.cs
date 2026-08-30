@@ -243,12 +243,6 @@ public class ScheduleEnforcerTask : IScheduledTask
         // revoke without an extra IDeviceManager lookup. Forcing a fresh login means the next
         // attempt to resume is blocked by Jellyfin's own native Access Schedule outside the window.
         //
-        // Revokes ALL of this user's tokens (not just this device) -- deliberately broad: a
-        // scheduled user having another live device at cutoff is itself worth ending, and
-        // SessionInfo exposes no access-token property that would allow a narrower per-device
-        // revoke without an extra IDeviceManager lookup. Forcing a fresh login means the next
-        // attempt to resume is blocked by Jellyfin's own native Access Schedule outside the window.
-        //
         // RevokeUserTokens(Guid, string) takes no CancellationToken (confirmed by reflection
         // against 10.11.11), so WaitAsync bounds it with the same per-command timeout as the rest.
         var revoked = await TryRunCommandAsync(ct => _sessionManager.RevokeUserTokens(userId, null).WaitAsync(ct), taskToken).ConfigureAwait(false);
