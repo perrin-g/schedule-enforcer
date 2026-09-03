@@ -193,6 +193,14 @@ public class ScheduleEnforcerTask : IScheduledTask
             return;
         }
 
+        // Inside a covering window: this user is currently permitted to play, so any standing kill
+        // from an EARLIER window must be lifted. Jellyfin AccessSchedules allow several windows a
+        // day; without this, a second window opening within the registry's 2-hour prune cutoff of
+        // the first one's end would find the user still marked killed, and their first legitimate
+        // PlaybackInfo call would be killed on sight with no diagnostic. Silently locking out a
+        // permitted user is the worse failure direction for a parental-controls plugin.
+        _streamKillRegistry.ClearUser(user.Id);
+
         var minutesLeft = (windowEndUtc - nowUtc).TotalMinutes;
         if (minutesLeft <= config.WarningMinutesBeforeEnd &&
             _state.TryMarkWarned(user.Id, deviceId, windowEndUtc, nowUtc))

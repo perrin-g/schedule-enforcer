@@ -242,6 +242,66 @@ public class ScheduleEnforcerTaskTests
     }
 
     [Fact]
+    public async Task ExecuteAsync_WithinCoveringWindow_ClearsAnEarlierKillSoPlaybackIsNotBlocked()
+    {
+        // Jellyfin AccessSchedules allow several windows a day. A user killed at the end of the
+        // first window keeps that kill for the registry's 2-hour prune cutoff, so a second window
+        // opening inside that cutoff would have their legitimately permitted playback killed on
+        // sight, with no diagnostic. The per-tick covering-window branch must lift the kill.
+        var sessionManager = new Mock<ISessionManager>();
+        var userManager = new Mock<IUserManager>();
+        var notifier = new Mock<INotifier>();
+        var realState = new SessionEnforcementState();
+        // Real registry, not a mock: this test is about the user actually not being blocked,
+        // not about a call being made.
+        var registry = new StreamKillRegistry(Mock.Of<Microsoft.Extensions.Logging.ILogger<StreamKillRegistry>>());
+
+        var user = CreateUser(isAdministrator: false, new AccessSchedule(DynamicDayOfWeek.Everyday, 13.0, 17.0, Guid.NewGuid()));
+        var session = CreateControllableSession(user.Id, "device-1");
+        sessionManager.Setup(m => m.Sessions).Returns(new List<SessionInfo> { session });
+        userManager.Setup(m => m.GetUserById(user.Id)).Returns(user);
+
+        // Tick 1: past the first window's end -> the user is killed.
+        var pastWindow = WindowEndingAt(DateTimeOffset.UtcNow.AddMinutes(-1));
+        var killingTask = new ScheduleEnforcerTask(sessionManager.Object, userManager.Object, pastWindow.Object, realState, registry, notifier.Object, Auckland, () => DefaultConfig(), Mock.Of<Microsoft.Extensions.Logging.ILogger<ScheduleEnforcerTask>>());
+        await killingTask.ExecuteAsync(new Progress<double>(), CancellationToken.None);
+
+        registry.RecordPlaySessionOwner("first-window-session", user.Id, DateTimeOffset.UtcNow);
+        Assert.True(registry.IsPlaySessionKilled("first-window-session"));
+
+        // Tick 2: a second, currently-covering window has opened.
+        var openWindow = WindowEndingAt(DateTimeOffset.UtcNow.AddHours(1));
+        var permittingTask = new ScheduleEnforcerTask(sessionManager.Object, userManager.Object, openWindow.Object, realState, registry, notifier.Object, Auckland, () => DefaultConfig(), Mock.Of<Microsoft.Extensions.Logging.ILogger<ScheduleEnforcerTask>>());
+        await permittingTask.ExecuteAsync(new Progress<double>(), CancellationToken.None);
+
+        // The user's new, legitimate playback must not be blocked.
+        registry.RecordPlaySessionOwner("second-window-session", user.Id, DateTimeOffset.UtcNow);
+        Assert.False(registry.IsPlaySessionKilled("second-window-session"));
+    }
+
+    [Fact]
+    public async Task ExecuteAsync_PastWindowEnd_DoesNotClearTheKillItJustApplied()
+    {
+        var sessionManager = new Mock<ISessionManager>();
+        var userManager = new Mock<IUserManager>();
+        var notifier = new Mock<INotifier>();
+        var realState = new SessionEnforcementState();
+        var streamKillRegistry = new Mock<IStreamKillRegistry>();
+
+        var user = CreateUser(isAdministrator: false, new AccessSchedule(DynamicDayOfWeek.Everyday, 13.0, 17.0, Guid.NewGuid()));
+        var session = CreateControllableSession(user.Id, "device-1");
+        sessionManager.Setup(m => m.Sessions).Returns(new List<SessionInfo> { session });
+        userManager.Setup(m => m.GetUserById(user.Id)).Returns(user);
+        var windowCalculator = WindowEndingAt(DateTimeOffset.UtcNow.AddMinutes(-1));
+
+        var task = new ScheduleEnforcerTask(sessionManager.Object, userManager.Object, windowCalculator.Object, realState, streamKillRegistry.Object, notifier.Object, Auckland, () => DefaultConfig(), Mock.Of<Microsoft.Extensions.Logging.ILogger<ScheduleEnforcerTask>>());
+
+        await task.ExecuteAsync(new Progress<double>(), CancellationToken.None);
+
+        streamKillRegistry.Verify(r => r.ClearUser(It.IsAny<Guid>()), Times.Never);
+    }
+
+    [Fact]
     public async Task ExecuteAsync_WithinWarningWindow_SendsWarningOnceWithMinutesSubstituted()
     {
         var sessionManager = new Mock<ISessionManager>();
