@@ -1,5 +1,3 @@
-using System;
-using System.Threading;
 using Jellyfin.Plugin.ScheduleEnforcer.Services;
 using Moq;
 using Xunit;
@@ -149,5 +147,40 @@ public class StreamKillRegistryTests
         var found = registry.TryGetOwner(PlaySessionId, out var userId);
         Assert.True(found);
         Assert.Equal(UserId, userId);
+    }
+
+    [Fact]
+    public void PruneOlderThan_RemovesStaleKillEntry()
+    {
+        // Verify that kill entries age out and are pruned, allowing the user to be killed again later.
+        // This proves that _killedUsers doesn't grow unbounded.
+        var registry = new StreamKillRegistry(Mock.Of<Microsoft.Extensions.Logging.ILogger<StreamKillRegistry>>());
+        registry.RecordPlaySessionOwner(PlaySessionId, UserId, Now);
+        registry.KillUser(UserId, Now);
+
+        // Prune with a cutoff after the kill timestamp - should remove the kill entry
+        registry.PruneOlderThan(Now.AddHours(1));
+
+        // Record a new PlaySessionId for the same user after the prune
+        var newPlaySessionId = "session-2";
+        registry.RecordPlaySessionOwner(newPlaySessionId, UserId, Now.AddHours(1));
+
+        // The new session should NOT be killed because the old kill entry was pruned
+        Assert.False(registry.IsPlaySessionKilled(newPlaySessionId));
+    }
+
+    [Fact]
+    public void PruneOlderThan_KeepsRecentKillEntry()
+    {
+        // Verify that kill entries do NOT get pruned while still "fresh" (cutoff before kill timestamp).
+        var registry = new StreamKillRegistry(Mock.Of<Microsoft.Extensions.Logging.ILogger<StreamKillRegistry>>());
+        registry.RecordPlaySessionOwner(PlaySessionId, UserId, Now);
+        registry.KillUser(UserId, Now);
+
+        // Prune with a cutoff before the kill timestamp - should NOT remove the kill entry
+        registry.PruneOlderThan(Now.AddHours(-1));
+
+        // The session should still be marked as killed
+        Assert.True(registry.IsPlaySessionKilled(PlaySessionId));
     }
 }

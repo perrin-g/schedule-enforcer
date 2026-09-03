@@ -1,6 +1,4 @@
-using System;
 using System.Collections.Concurrent;
-using System.Linq;
 using Microsoft.Extensions.Logging;
 
 namespace Jellyfin.Plugin.ScheduleEnforcer.Services;
@@ -19,13 +17,12 @@ public class StreamKillRegistry : IStreamKillRegistry
 
     private sealed class TrackedRequest
     {
-        public Guid TrackingId;
         public Action Abort = () => { };
     }
 
     private readonly ConcurrentDictionary<string, OwnerEntry> _owners = new();
     private readonly ConcurrentDictionary<string, ConcurrentDictionary<Guid, TrackedRequest>> _active = new();
-    private readonly ConcurrentDictionary<Guid, bool> _killedUsers = new();
+    private readonly ConcurrentDictionary<Guid, DateTimeOffset> _killedUsers = new();
     private readonly ILogger<StreamKillRegistry> _logger;
 
     public StreamKillRegistry(ILogger<StreamKillRegistry> logger)
@@ -53,7 +50,7 @@ public class StreamKillRegistry : IStreamKillRegistry
     public void TrackActiveRequest(string playSessionId, Guid trackingId, Action abort)
     {
         var bucket = _active.GetOrAdd(playSessionId, _ => new ConcurrentDictionary<Guid, TrackedRequest>());
-        bucket[trackingId] = new TrackedRequest { TrackingId = trackingId, Abort = abort };
+        bucket[trackingId] = new TrackedRequest { Abort = abort };
     }
 
     public void UntrackActiveRequest(string playSessionId, Guid trackingId)
@@ -66,7 +63,7 @@ public class StreamKillRegistry : IStreamKillRegistry
 
     public void KillUser(Guid userId, DateTimeOffset nowUtc)
     {
-        _killedUsers[userId] = true;
+        _killedUsers[userId] = nowUtc;
 
         // Only PlaySessionIds owned by this user, not a full scan of every active request --
         // owners can outnumber active requests once idle sessions accumulate before pruning.
@@ -102,6 +99,11 @@ public class StreamKillRegistry : IStreamKillRegistry
         {
             _owners.TryRemove(kvp.Key, out _);
             _active.TryRemove(kvp.Key, out _);
+        }
+
+        foreach (var kvp in _killedUsers.Where(kvp => kvp.Value < cutoffUtc).ToList())
+        {
+            _killedUsers.TryRemove(kvp.Key, out _);
         }
     }
 }
