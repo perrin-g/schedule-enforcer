@@ -2,7 +2,7 @@
   <PropertyGroup>
     <!-- Must stay in step with meta.json / manifest.json's version entry and the
          ScheduleEnforcer_<version> plugin directory name on the server. -->
-    <Version>0.1.0.0</Version>
+    <Version>0.2.0.0</Version>
     <AssemblyName>Jellyfin.Plugin.ScheduleEnforcer</AssemblyName>
     <RootNamespace>Jellyfin.Plugin.ScheduleEnforcer</RootNamespace>
   </PropertyGroup>
