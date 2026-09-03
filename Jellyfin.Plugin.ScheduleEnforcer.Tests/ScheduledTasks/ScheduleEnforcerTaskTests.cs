@@ -93,7 +93,7 @@ public class ScheduleEnforcerTaskTests
         sessionManager.Setup(m => m.Sessions).Returns(new List<SessionInfo> { session });
         userManager.Setup(m => m.GetUserById(adminUser.Id)).Returns(adminUser);
 
-        var task = new ScheduleEnforcerTask(sessionManager.Object, userManager.Object, windowCalculator.Object, state.Object, notifier.Object, Auckland, () => DefaultConfig(), Mock.Of<Microsoft.Extensions.Logging.ILogger<ScheduleEnforcerTask>>());
+        var task = new ScheduleEnforcerTask(sessionManager.Object, userManager.Object, windowCalculator.Object, state.Object, Mock.Of<IStreamKillRegistry>(), notifier.Object, Auckland, () => DefaultConfig(), Mock.Of<Microsoft.Extensions.Logging.ILogger<ScheduleEnforcerTask>>());
 
         await task.ExecuteAsync(new Progress<double>(), CancellationToken.None);
 
@@ -120,7 +120,7 @@ public class ScheduleEnforcerTaskTests
         userManager.Setup(m => m.GetUserById(throwingUserId)).Throws(new InvalidOperationException("simulated failure"));
         userManager.Setup(m => m.GetUserById(okUser.Id)).Returns(okUser);
 
-        var task = new ScheduleEnforcerTask(sessionManager.Object, userManager.Object, windowCalculator.Object, state.Object, notifier.Object, Auckland, () => DefaultConfig(), Mock.Of<Microsoft.Extensions.Logging.ILogger<ScheduleEnforcerTask>>());
+        var task = new ScheduleEnforcerTask(sessionManager.Object, userManager.Object, windowCalculator.Object, state.Object, Mock.Of<IStreamKillRegistry>(), notifier.Object, Auckland, () => DefaultConfig(), Mock.Of<Microsoft.Extensions.Logging.ILogger<ScheduleEnforcerTask>>());
 
         await task.ExecuteAsync(new Progress<double>(), CancellationToken.None);
 
@@ -137,7 +137,7 @@ public class ScheduleEnforcerTaskTests
         var notifier = new Mock<INotifier>();
         sessionManager.Setup(m => m.Sessions).Returns(new List<SessionInfo>());
 
-        var task = new ScheduleEnforcerTask(sessionManager.Object, userManager.Object, windowCalculator.Object, state.Object, notifier.Object, Auckland, () => DefaultConfig(), Mock.Of<Microsoft.Extensions.Logging.ILogger<ScheduleEnforcerTask>>());
+        var task = new ScheduleEnforcerTask(sessionManager.Object, userManager.Object, windowCalculator.Object, state.Object, Mock.Of<IStreamKillRegistry>(), notifier.Object, Auckland, () => DefaultConfig(), Mock.Of<Microsoft.Extensions.Logging.ILogger<ScheduleEnforcerTask>>());
         using var cts = new CancellationTokenSource();
         cts.Cancel();
 
@@ -151,7 +151,7 @@ public class ScheduleEnforcerTaskTests
     {
         var task = new ScheduleEnforcerTask(
             Mock.Of<ISessionManager>(), Mock.Of<IUserManager>(), Mock.Of<IScheduleWindowCalculator>(),
-            Mock.Of<ISessionEnforcementState>(), Mock.Of<INotifier>(), Auckland, () => DefaultConfig(), Mock.Of<Microsoft.Extensions.Logging.ILogger<ScheduleEnforcerTask>>());
+            Mock.Of<ISessionEnforcementState>(), Mock.Of<IStreamKillRegistry>(), Mock.Of<INotifier>(), Auckland, () => DefaultConfig(), Mock.Of<Microsoft.Extensions.Logging.ILogger<ScheduleEnforcerTask>>());
 
         var triggers = task.GetDefaultTriggers().ToList();
 
@@ -178,7 +178,7 @@ public class ScheduleEnforcerTaskTests
         windowCalculator.Setup(c => c.GetCurrentWindow(It.IsAny<IReadOnlyList<AccessSchedule>>(), It.IsAny<DateTimeOffset>(), It.IsAny<TimeZoneInfo>()))
             .Returns(new ScheduleWindowResult { HasCoveringWindow = false, WindowEndUtc = null });
 
-        var task = new ScheduleEnforcerTask(sessionManager.Object, userManager.Object, windowCalculator.Object, realState, notifier.Object, Auckland, () => DefaultConfig(), Mock.Of<Microsoft.Extensions.Logging.ILogger<ScheduleEnforcerTask>>());
+        var task = new ScheduleEnforcerTask(sessionManager.Object, userManager.Object, windowCalculator.Object, realState, Mock.Of<IStreamKillRegistry>(), notifier.Object, Auckland, () => DefaultConfig(), Mock.Of<Microsoft.Extensions.Logging.ILogger<ScheduleEnforcerTask>>());
 
         await task.ExecuteAsync(new Progress<double>(), CancellationToken.None);
         await task.ExecuteAsync(new Progress<double>(), CancellationToken.None);
@@ -206,7 +206,7 @@ public class ScheduleEnforcerTaskTests
         var windowCalculator = WindowEndingAt(DateTimeOffset.UtcNow.AddMinutes(-1));
 
         var config = DefaultConfig();
-        var task = new ScheduleEnforcerTask(sessionManager.Object, userManager.Object, windowCalculator.Object, realState, notifier.Object, Auckland, () => config, Mock.Of<Microsoft.Extensions.Logging.ILogger<ScheduleEnforcerTask>>());
+        var task = new ScheduleEnforcerTask(sessionManager.Object, userManager.Object, windowCalculator.Object, realState, Mock.Of<IStreamKillRegistry>(), notifier.Object, Auckland, () => config, Mock.Of<Microsoft.Extensions.Logging.ILogger<ScheduleEnforcerTask>>());
 
         await task.ExecuteAsync(new Progress<double>(), CancellationToken.None);
 
@@ -217,6 +217,28 @@ public class ScheduleEnforcerTaskTests
             m => m.SendPlaystateCommand(It.IsAny<string>(), session.Id, It.Is<PlaystateRequest>(r => r.Command == PlaystateCommand.Stop), It.IsAny<CancellationToken>()),
             Times.Once);
         sessionManager.Verify(m => m.RevokeUserTokens(user.Id, null), Times.Once);
+    }
+
+    [Fact]
+    public async Task ExecuteAsync_PastWindowEnd_CallsStreamKillRegistryKillUser()
+    {
+        var sessionManager = new Mock<ISessionManager>();
+        var userManager = new Mock<IUserManager>();
+        var notifier = new Mock<INotifier>();
+        var realState = new SessionEnforcementState();
+        var streamKillRegistry = new Mock<IStreamKillRegistry>();
+
+        var user = CreateUser(isAdministrator: false, new AccessSchedule(DynamicDayOfWeek.Everyday, 13.0, 17.0, Guid.NewGuid()));
+        var session = CreateControllableSession(user.Id, "device-1");
+        sessionManager.Setup(m => m.Sessions).Returns(new List<SessionInfo> { session });
+        userManager.Setup(m => m.GetUserById(user.Id)).Returns(user);
+        var windowCalculator = WindowEndingAt(DateTimeOffset.UtcNow.AddMinutes(-1));
+
+        var task = new ScheduleEnforcerTask(sessionManager.Object, userManager.Object, windowCalculator.Object, realState, streamKillRegistry.Object, notifier.Object, Auckland, () => DefaultConfig(), Mock.Of<Microsoft.Extensions.Logging.ILogger<ScheduleEnforcerTask>>());
+
+        await task.ExecuteAsync(new Progress<double>(), CancellationToken.None);
+
+        streamKillRegistry.Verify(r => r.KillUser(user.Id, It.IsAny<DateTimeOffset>()), Times.Once);
     }
 
     [Fact]
@@ -233,7 +255,7 @@ public class ScheduleEnforcerTaskTests
         userManager.Setup(m => m.GetUserById(user.Id)).Returns(user);
         var windowCalculator = WindowEndingAt(DateTimeOffset.UtcNow.AddMinutes(5));
 
-        var task = new ScheduleEnforcerTask(sessionManager.Object, userManager.Object, windowCalculator.Object, realState, notifier.Object, Auckland, () => DefaultConfig(), Mock.Of<Microsoft.Extensions.Logging.ILogger<ScheduleEnforcerTask>>());
+        var task = new ScheduleEnforcerTask(sessionManager.Object, userManager.Object, windowCalculator.Object, realState, Mock.Of<IStreamKillRegistry>(), notifier.Object, Auckland, () => DefaultConfig(), Mock.Of<Microsoft.Extensions.Logging.ILogger<ScheduleEnforcerTask>>());
 
         await task.ExecuteAsync(new Progress<double>(), CancellationToken.None);
         await task.ExecuteAsync(new Progress<double>(), CancellationToken.None);
@@ -263,7 +285,7 @@ public class ScheduleEnforcerTaskTests
         userManager.Setup(m => m.GetUserById(user.Id)).Returns(user);
         var windowCalculator = WindowEndingAt(DateTimeOffset.UtcNow.AddMinutes(-1));
 
-        var task = new ScheduleEnforcerTask(sessionManager.Object, userManager.Object, windowCalculator.Object, realState, notifier.Object, Auckland, () => DefaultConfig(), Mock.Of<Microsoft.Extensions.Logging.ILogger<ScheduleEnforcerTask>>());
+        var task = new ScheduleEnforcerTask(sessionManager.Object, userManager.Object, windowCalculator.Object, realState, Mock.Of<IStreamKillRegistry>(), notifier.Object, Auckland, () => DefaultConfig(), Mock.Of<Microsoft.Extensions.Logging.ILogger<ScheduleEnforcerTask>>());
 
         await task.ExecuteAsync(new Progress<double>(), CancellationToken.None);
         await task.ExecuteAsync(new Progress<double>(), CancellationToken.None);
@@ -306,7 +328,7 @@ public class ScheduleEnforcerTaskTests
             .Returns((string _, string _, PlaystateRequest _, CancellationToken ct) => Task.Delay(Timeout.Infinite, ct));
 
         var task = new ScheduleEnforcerTask(
-            sessionManager.Object, userManager.Object, windowCalculator.Object, realState, notifier.Object, Auckland,
+            sessionManager.Object, userManager.Object, windowCalculator.Object, realState, Mock.Of<IStreamKillRegistry>(), notifier.Object, Auckland,
             () => DefaultConfig(), Mock.Of<Microsoft.Extensions.Logging.ILogger<ScheduleEnforcerTask>>(),
             commandTimeout: TimeSpan.FromMilliseconds(50));
 
@@ -342,7 +364,7 @@ public class ScheduleEnforcerTaskTests
         userManager.Setup(m => m.GetUserById(user.Id)).Returns(user);
         var windowCalculator = WindowEndingAt(DateTimeOffset.UtcNow.AddMinutes(-1));
 
-        var task = new ScheduleEnforcerTask(sessionManager.Object, userManager.Object, windowCalculator.Object, realState, notifier.Object, Auckland, () => DefaultConfig(), Mock.Of<Microsoft.Extensions.Logging.ILogger<ScheduleEnforcerTask>>());
+        var task = new ScheduleEnforcerTask(sessionManager.Object, userManager.Object, windowCalculator.Object, realState, Mock.Of<IStreamKillRegistry>(), notifier.Object, Auckland, () => DefaultConfig(), Mock.Of<Microsoft.Extensions.Logging.ILogger<ScheduleEnforcerTask>>());
 
         // Tick 1: playing, so enforcement runs.
         await task.ExecuteAsync(new Progress<double>(), CancellationToken.None);
@@ -392,7 +414,7 @@ public class ScheduleEnforcerTaskTests
             .Returns(() => Task.Delay(Timeout.InfiniteTimeSpan));
 
         var task = new ScheduleEnforcerTask(
-            sessionManager.Object, userManager.Object, windowCalculator.Object, realState, notifier.Object, Auckland,
+            sessionManager.Object, userManager.Object, windowCalculator.Object, realState, Mock.Of<IStreamKillRegistry>(), notifier.Object, Auckland,
             () => DefaultConfig(), Mock.Of<Microsoft.Extensions.Logging.ILogger<ScheduleEnforcerTask>>(),
             commandTimeout: TimeSpan.FromMilliseconds(50));
 
@@ -435,7 +457,7 @@ public class ScheduleEnforcerTaskTests
             .Setup(m => m.RevokeUserTokens(It.IsAny<Guid>(), It.IsAny<string>()))
             .Throws(new InvalidOperationException("simulated database failure"));
 
-        var task = new ScheduleEnforcerTask(sessionManager.Object, userManager.Object, windowCalculator.Object, realState, notifier.Object, Auckland, () => DefaultConfig(), Mock.Of<Microsoft.Extensions.Logging.ILogger<ScheduleEnforcerTask>>());
+        var task = new ScheduleEnforcerTask(sessionManager.Object, userManager.Object, windowCalculator.Object, realState, Mock.Of<IStreamKillRegistry>(), notifier.Object, Auckland, () => DefaultConfig(), Mock.Of<Microsoft.Extensions.Logging.ILogger<ScheduleEnforcerTask>>());
 
         await task.ExecuteAsync(new Progress<double>(), CancellationToken.None);
 
@@ -468,7 +490,7 @@ public class ScheduleEnforcerTaskTests
             .Setup(m => m.SendMessageCommand(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<MessageCommand>(), It.IsAny<CancellationToken>()))
             .Throws(new InvalidOperationException("simulated transport failure"));
 
-        var task = new ScheduleEnforcerTask(sessionManager.Object, userManager.Object, windowCalculator.Object, realState, notifier.Object, Auckland, () => DefaultConfig(), Mock.Of<Microsoft.Extensions.Logging.ILogger<ScheduleEnforcerTask>>());
+        var task = new ScheduleEnforcerTask(sessionManager.Object, userManager.Object, windowCalculator.Object, realState, Mock.Of<IStreamKillRegistry>(), notifier.Object, Auckland, () => DefaultConfig(), Mock.Of<Microsoft.Extensions.Logging.ILogger<ScheduleEnforcerTask>>());
 
         await task.ExecuteAsync(new Progress<double>(), CancellationToken.None);
 
@@ -504,7 +526,7 @@ public class ScheduleEnforcerTaskTests
                 return Task.Delay(Timeout.Infinite, ct);
             });
 
-        var task = new ScheduleEnforcerTask(sessionManager.Object, userManager.Object, windowCalculator.Object, realState, notifier.Object, Auckland, () => DefaultConfig(), Mock.Of<Microsoft.Extensions.Logging.ILogger<ScheduleEnforcerTask>>());
+        var task = new ScheduleEnforcerTask(sessionManager.Object, userManager.Object, windowCalculator.Object, realState, Mock.Of<IStreamKillRegistry>(), notifier.Object, Auckland, () => DefaultConfig(), Mock.Of<Microsoft.Extensions.Logging.ILogger<ScheduleEnforcerTask>>());
 
         await Assert.ThrowsAnyAsync<OperationCanceledException>(() => task.ExecuteAsync(new Progress<double>(), cts.Token));
     }
@@ -515,7 +537,7 @@ public class ScheduleEnforcerTaskTests
         var sessionManager = new Mock<ISessionManager>();
         var task = new ScheduleEnforcerTask(
             sessionManager.Object, Mock.Of<IUserManager>(), Mock.Of<IScheduleWindowCalculator>(),
-            Mock.Of<ISessionEnforcementState>(), Mock.Of<INotifier>(), Auckland,
+            Mock.Of<ISessionEnforcementState>(), Mock.Of<IStreamKillRegistry>(), Mock.Of<INotifier>(), Auckland,
             () => new PluginConfiguration { Enabled = false }, Mock.Of<Microsoft.Extensions.Logging.ILogger<ScheduleEnforcerTask>>());
 
         await task.ExecuteAsync(new Progress<double>(), CancellationToken.None);
