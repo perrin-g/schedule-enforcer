@@ -1,5 +1,3 @@
-using System;
-
 namespace Jellyfin.Plugin.ScheduleEnforcer.Services;
 
 public interface IStreamKillRegistry
