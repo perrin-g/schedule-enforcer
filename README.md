@@ -15,6 +15,13 @@ closes that gap.
   seconds later) and sends `Stop` to any session that supports media control.
 - **Works on paused sessions too** — enforcement isn't gated on whether the client currently
   reports something playing, so a session paused right at the cutoff still gets revoked.
+- **Kills the already-open stream, not just the token** — token revoke alone doesn't stop bytes
+  already in flight: transcoded/HLS segments already buffered play through regardless, and
+  DirectPlay's data channel carries no auth token at all, so revoke has *zero* effect on it. At
+  the same cutoff moment the token is revoked, this plugin also aborts the live connection
+  (Kestrel `HttpContext.Abort()`, a real TCP reset) and rejects any reconnect attempt using the
+  same play session — for both Transcode/HLS and DirectPlay. See
+  [Guaranteed stream kill](#guaranteed-stream-kill) below.
 - **Admins are never enforced**, unconditionally.
 - **Read-only against schedules** — it doesn't create or manage Access Schedules itself; set
   those up as normal under Dashboard → Users → *user* → Access Schedule, and this plugin enforces
@@ -40,6 +47,45 @@ configured:
    doesn't depend on anything the client reports.
 3. Revoking the token means the next login attempt is itself blocked by Jellyfin's own native
    Access Schedule, until the user's next allowed window opens.
+
+## Guaranteed stream kill
+
+Token revoke and `Stop` (see [How it works](#how-it-works) above) correctly block *starting* new
+playback, but neither one reliably stops a stream that's already open at cutoff:
+
+- **Transcode/HLS** streams fetch data as a sequence of short-lived, separately-authenticated
+  segment requests, so revoke *eventually* blocks the next segment — but not instantly, and a
+  client with several segments already buffered plays through them regardless.
+- **DirectPlay** is worse: its data requests (`?static=true&...`) carry **no auth token at all**.
+  They're authorized purely by `playSessionId` matching an open playback session, entirely
+  decoupled from the user's access token — so revoking the token has *zero* effect on an
+  in-progress DirectPlay stream.
+- `Stop` is a WebSocket message asking the client to stop. It's advisory, not enforced — nothing
+  obliges a client to honor it, or to honor it promptly.
+
+To close this gap, the plugin also registers two ASP.NET Core middleware components directly into
+Jellyfin's own request pipeline (via `IStartupFilter`, the same mechanism demonstrated by
+[jellyfin-plugin-dedupe-continue-watching](https://github.com/SloMR/jellyfin-plugin-dedupe-continue-watching)
+— see [Credits](#credits)):
+
+1. One intercepts `POST`/`GET /Items/{id}/PlaybackInfo` — the point in Jellyfin's request
+   lifecycle where a real, authenticated `UserId` and a freshly-minted `PlaySessionId` are both
+   present together — and records the `playSessionId → UserId` mapping.
+2. The other sits in front of the `/videos/` and `/audio/` streaming routes. On every matching
+   request it checks the `playSessionId` query parameter against that mapping and, if the owning
+   user has been killed, aborts the connection outright (`HttpContext.Abort()` — a real TCP reset,
+   not a request) — and keeps rejecting every subsequent request with that same `playSessionId`,
+   not just whatever was in flight at the moment of the kill, so a client can't just silently
+   reconnect.
+
+At the same tick `ScheduleEnforcerTask` revokes a user's tokens, it also calls this kill switch —
+so a session already playing at cutoff is aborted the same way, for both Transcode/HLS and
+DirectPlay, instead of playing on regardless.
+
+**Status:** implemented and code-reviewed (unit tests cover the pure state-tracking registry;
+the middleware itself is deliberately not unit tested — real `HttpContext`/ASP.NET pipeline
+behavior isn't meaningfully mockable, so it's verified against a live server instead). Not yet
+deployed or live-verified as of this writing.
 
 ## Build, test, deploy
 
@@ -102,6 +148,8 @@ jq --arg url "https://github.com/perrin-g/schedule-enforcer/releases/download/v$
 
 ## Installing
 
+### Via the Catalog (recommended)
+
 Add this repository under Dashboard → Plugins → Repositories:
 
 ```
@@ -109,6 +157,34 @@ https://raw.githubusercontent.com/perrin-g/schedule-enforcer/master/manifest.jso
 ```
 
 Schedule Enforcer will then appear in the Catalog to install like any other plugin.
+
+### Manual install
+
+Use this if the server has no outbound access to GitHub, or you want to pin a specific release.
+
+1. Download `ScheduleEnforcer_<version>.zip` from [Releases](https://github.com/perrin-g/schedule-enforcer/releases)
+   (or build it yourself — see [Build, test, deploy](#build-test-deploy) above).
+2. Unzip it into its own versioned folder under Jellyfin's plugins directory:
+   ```bash
+   mkdir -p <jellyfin-plugins-dir>/ScheduleEnforcer_<version>
+   unzip ScheduleEnforcer_<version>.zip -d <jellyfin-plugins-dir>/ScheduleEnforcer_<version>
+   ```
+   The folder must contain `Jellyfin.Plugin.ScheduleEnforcer.dll` and `meta.json` directly (not
+   nested inside another subfolder) — Jellyfin's plugin discovery is metadata-driven, reading
+   `meta.json` from each top-level folder under the plugins directory, not just scanning for DLLs.
+3. Restart Jellyfin (`docker restart jellyfin`, or the equivalent for your install).
+4. Confirm it loaded: Dashboard → Plugins should list Schedule Enforcer, or check the logs:
+   ```bash
+   docker logs jellyfin --since 2m | grep -i ScheduleEnforcer
+   ```
+   Expect a plugin-loaded line. If nothing appears, see
+   [If the plugin seems to stop working after a restart](#if-the-plugin-seems-to-stop-working-after-a-restart)
+   below — the same silent-disable behavior can also affect a first install if the DLL is
+   incompatible with the running Jellyfin version.
+
+Upgrading later is the same steps with the new version's zip in its own new
+`ScheduleEnforcer_<version>` folder — Jellyfin does not require the old version's folder to be
+removed first, but it's fine to delete it once the new version is confirmed working.
 
 ## If the plugin seems to stop working after a restart
 
@@ -133,10 +209,9 @@ A deploy that looks like it did nothing is far more likely to be this than a cod
 
 ## Credits
 
-An in-progress fix for the gap where an already-playing session outlives a revoked token (see
-`ScheduleEnforcerTask`'s `RevokeUserTokens` call above) uses `IPluginServiceRegistrator` +
-`IStartupFilter` to hook Jellyfin's ASP.NET Core request pipeline directly. That pattern was
-confirmed viable by a real precedent:
+The [Guaranteed stream kill](#guaranteed-stream-kill) middleware's use of `IPluginServiceRegistrator`
++ `IStartupFilter` to hook Jellyfin's ASP.NET Core request pipeline directly was confirmed viable
+by a real precedent:
 [SloMR/jellyfin-plugin-dedupe-continue-watching](https://github.com/SloMR/jellyfin-plugin-dedupe-continue-watching),
 which demonstrated the same DI + middleware registration approach for an unrelated feature
 (deduplicating the Continue Watching row).
