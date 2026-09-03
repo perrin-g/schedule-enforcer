@@ -24,6 +24,7 @@ public class ServiceRegistrator : IPluginServiceRegistrator
         serviceCollection.AddSingleton<IStreamKillRegistry, StreamKillRegistry>();
 
         serviceCollection.AddTransient<Microsoft.AspNetCore.Hosting.IStartupFilter, Middleware.PlaybackInfoKillMappingStartupFilter>();
+        serviceCollection.AddTransient<Microsoft.AspNetCore.Hosting.IStartupFilter, Middleware.StreamKillStartupFilter>();
 
         // LoggingNotifier's IActivityManager dependency needs no registration of its own -- it is a
         // core Jellyfin service already in the host container, and constructor injection picks it up.
