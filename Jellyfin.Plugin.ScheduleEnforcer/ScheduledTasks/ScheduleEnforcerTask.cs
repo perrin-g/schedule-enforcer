@@ -34,6 +34,7 @@ public class ScheduleEnforcerTask : IScheduledTask
     private readonly IUserManager _userManager;
     private readonly IScheduleWindowCalculator _windowCalculator;
     private readonly ISessionEnforcementState _state;
+    private readonly IStreamKillRegistry _streamKillRegistry;
     private readonly INotifier _notifier;
     private readonly TimeZoneInfo _timeZone;
     private readonly Func<PluginConfiguration> _getConfig;
@@ -53,6 +54,7 @@ public class ScheduleEnforcerTask : IScheduledTask
         IUserManager userManager,
         IScheduleWindowCalculator windowCalculator,
         ISessionEnforcementState state,
+        IStreamKillRegistry streamKillRegistry,
         INotifier notifier,
         TimeZoneInfo timeZone,
         Func<PluginConfiguration> getConfig,
@@ -66,6 +68,7 @@ public class ScheduleEnforcerTask : IScheduledTask
         _userManager = userManager;
         _windowCalculator = windowCalculator;
         _state = state;
+        _streamKillRegistry = streamKillRegistry;
         _notifier = notifier;
         _timeZone = timeZone;
         _getConfig = getConfig;
@@ -108,6 +111,7 @@ public class ScheduleEnforcerTask : IScheduledTask
 
         var nowUtc = DateTimeOffset.UtcNow;
         _state.PruneOlderThan(nowUtc.AddHours(-2));
+        _streamKillRegistry.PruneOlderThan(nowUtc.AddHours(-2));
         PruneRetryCounts(nowUtc.AddHours(-2));
 
         var sessions = _sessionManager.Sessions.ToList();
@@ -250,6 +254,12 @@ public class ScheduleEnforcerTask : IScheduledTask
         {
             _logger.LogWarning("ScheduleEnforcer: token revoke for user {UserId} did not complete", userId);
         }
+
+        // Same unconditional, every-tick treatment as the revoke call above (see the comment on
+        // RevokeUserTokens's call site for why three prior gates had to be removed from in front of
+        // it) -- this closes the gap that revoke alone leaves open: an already-open stream that
+        // revoke does not touch, confirmed live 2026-09-01.
+        _streamKillRegistry.KillUser(userId, nowUtc);
 
         // Everything BELOW this point is gated on the session actually still playing something.
         // "Still listed in ISessionManager.Sessions" is NOT evidence that enforcement failed --
