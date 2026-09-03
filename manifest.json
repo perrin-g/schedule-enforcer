@@ -11,7 +11,7 @@
       {
         "version": "0.2.0.0",
         "targetAbi": "10.11.0.0",
-        "changelog": "Guaranteed stream kill: aborts already-open Transcode/HLS and DirectPlay streams at schedule cutoff, not just token revoke.",
+        "changelog": "Active stream kill: aborts already-open Transcode/HLS and DirectPlay streams at schedule cutoff, not just token revoke.",
         "timestamp": "2026-09-03T06:48:10Z",
         "sourceUrl": "https://github.com/perrin-g/schedule-enforcer/releases/download/v0.2.0/ScheduleEnforcer_0.2.0.0.zip",
         "checksum": "4a9b363dae4de7e97fdbcdd9a247da02"

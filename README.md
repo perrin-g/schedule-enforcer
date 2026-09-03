@@ -16,7 +16,7 @@ closes that gap.
 - **Works on paused sessions too** — enforcement isn't gated on whether the client currently
   reports something playing, so a session paused right at the cutoff still gets revoked.
 - **Kills the already-open stream, not just the token** — a real TCP reset on the connection
-  itself, not just a revoked token. See [Guaranteed stream kill](#guaranteed-stream-kill) below.
+  itself, not just a revoked token. See [Active stream kill](#active-stream-kill) below.
 - **Admins are never enforced**, unconditionally.
 - **Read-only against schedules** — it doesn't create or manage Access Schedules itself; set
   those up as normal under Dashboard → Users → *user* → Access Schedule, and this plugin enforces
@@ -43,7 +43,7 @@ configured:
 3. Revoking the token means the next login attempt is itself blocked by Jellyfin's own native
    Access Schedule, until the user's next allowed window opens.
 
-## Guaranteed stream kill
+## Active stream kill
 
 Token revoke and `Stop` (see [How it works](#how-it-works) above) block *starting* new playback,
 but neither reliably stops a stream that's already open at cutoff — Transcode/HLS plays through
@@ -58,64 +58,24 @@ covering both Transcode/HLS and DirectPlay. Confirmed live 2026-09-03 against a 
 session: stream killed, an unrelated admin's Transcode session unaffected, reconnect rejected,
 restart blocked by the still-closed schedule window.
 
-## Build, test, deploy
+## Known limitations
 
-```bash
-dotnet build Jellyfin.Plugin.ScheduleEnforcer/Jellyfin.Plugin.ScheduleEnforcer.csproj
-dotnet test  Jellyfin.Plugin.ScheduleEnforcer.Tests/Jellyfin.Plugin.ScheduleEnforcer.Tests.csproj
-```
+- **Warning/final messages don't render on every client** — rendering the `DisplayMessage`
+  command is up to each client, and support varies. As of this writing, Swiftfin (iOS) doesn't
+  yet display it ([tracked here](https://github.com/jellyfin/Swiftfin/blob/master/Shared/Services/UserSession/UserSessionManager%2BSocketCommands.swift)),
+  though this could change in a future Swiftfin release. Enforcement itself (revoke, stream kill)
+  doesn't depend on this and works the same either way — both confirmed on Swiftfin. Official
+  clients (Web, Android TV) render the message fine today.
+- **The 1-minute task tick can run closer to every 2 minutes in practice** — observed live
+  2026-09-03, source of the delay is Jellyfin's own scheduler, not this plugin. Adds up to another
+  minute of delay before a warning or cutoff fires.
 
-`<Version>` in the csproj is the single source of truth for the plugin version. After bumping
-it, run `scripts/sync-version.sh` to propagate it into `meta.json`/`manifest.json` — the deploy
-commands below read it back out via `jq` rather than hardcoding it.
+## Development & Contributing
 
-```bash
-./scripts/sync-version.sh
-dotnet build -c Release Jellyfin.Plugin.ScheduleEnforcer/Jellyfin.Plugin.ScheduleEnforcer.csproj
-
-VERSION=$(jq -r .version meta.json)
-ssh <user>@<jellyfin-host> "mkdir -p <jellyfin-plugins-dir>/ScheduleEnforcer_${VERSION}"
-scp Jellyfin.Plugin.ScheduleEnforcer/bin/Release/net9.0/Jellyfin.Plugin.ScheduleEnforcer.dll \
-    meta.json \
-    <user>@<jellyfin-host>:<jellyfin-plugins-dir>/ScheduleEnforcer_${VERSION}/
-ssh <user>@<jellyfin-host> "docker restart jellyfin"
-```
-
-Only the DLL is copied — everything else it references ships with Jellyfin. `meta.json` is
-required (Jellyfin's plugin discovery is metadata-driven, not "any DLL in a folder") and is
-committed here so deploys stop generating one ad hoc.
-
-Sanity check after a restart:
-
-```bash
-ssh <user>@<jellyfin-host> "docker logs jellyfin --since 2m | grep -i ScheduleEnforcer"
-```
-
-Expect a plugin-loaded line and `ScheduleEnforcer: resolved container timezone is
-Pacific/Auckland`. If that reads `UTC`, stop — every cutoff will fire against the wrong clock.
-
-### Cutting a release
-
-`manifest.json` is a real, working plugin-repository manifest (`sourceUrl`/`checksum` point at
-an actual GitHub release) and is registered in Jellyfin under Dashboard → Plugins → Repositories,
-so Jellyfin's own Catalog can see version updates once they're released this way — the scp deploy
-above is still the actual install mechanism for now, this just keeps the manifest truthful.
-
-```bash
-./scripts/sync-version.sh
-dotnet publish -c Release Jellyfin.Plugin.ScheduleEnforcer/Jellyfin.Plugin.ScheduleEnforcer.csproj -o dist/ScheduleEnforcer
-VERSION=$(jq -r .version meta.json)
-zip -j "dist/ScheduleEnforcer_${VERSION}.zip" dist/ScheduleEnforcer/Jellyfin.Plugin.ScheduleEnforcer.dll
-CHECKSUM=$(md5sum "dist/ScheduleEnforcer_${VERSION}.zip" | cut -d' ' -f1)
-git tag "v${VERSION%.0}" && git push origin "v${VERSION%.0}"
-gh release create "v${VERSION%.0}" "dist/ScheduleEnforcer_${VERSION}.zip" --title "v${VERSION%.0}" --notes "...
-
----
-Built with Claude Code"
-jq --arg url "https://github.com/perrin-g/schedule-enforcer/releases/download/v${VERSION%.0}/ScheduleEnforcer_${VERSION}.zip" \
-   --arg sum "$CHECKSUM" \
-   '.[0].versions[0].sourceUrl = $url | .[0].versions[0].checksum = $sum' manifest.json > manifest.json.tmp && mv manifest.json.tmp manifest.json
-```
+The plugin is written in C# / .NET 9 and compiled against Jellyfin 10.11.x APIs. `dotnet build`
+and `dotnet test` work as expected; `scripts/sync-version.sh` keeps the csproj's `<Version>` in
+sync with `meta.json`/`manifest.json` after a bump. See the repository for the full build/deploy
+and release process.
 
 ## Installing
 
@@ -134,7 +94,7 @@ Schedule Enforcer will then appear in the Catalog to install like any other plug
 Use this if the server has no outbound access to GitHub, or you want to pin a specific release.
 
 1. Download `ScheduleEnforcer_<version>.zip` from [Releases](https://github.com/perrin-g/schedule-enforcer/releases)
-   (or build it yourself — see [Build, test, deploy](#build-test-deploy) above).
+   (or build it yourself — see [Development & Contributing](#development--contributing) above).
 2. Unzip it into its own versioned folder under Jellyfin's plugins directory:
    ```bash
    mkdir -p <jellyfin-plugins-dir>/ScheduleEnforcer_<version>
@@ -180,7 +140,7 @@ A deploy that looks like it did nothing is far more likely to be this than a cod
 
 ## Credits
 
-The [Guaranteed stream kill](#guaranteed-stream-kill) middleware's use of `IPluginServiceRegistrator`
+The [Active stream kill](#active-stream-kill) middleware's use of `IPluginServiceRegistrator`
 + `IStartupFilter` to hook Jellyfin's ASP.NET Core request pipeline directly was confirmed viable
 by a real precedent:
 [SloMR/jellyfin-plugin-dedupe-continue-watching](https://github.com/SloMR/jellyfin-plugin-dedupe-continue-watching),
