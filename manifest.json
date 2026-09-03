@@ -9,7 +9,7 @@
     "owner": "perrin-g",
     "versions": [
       {
-        "version": "0.1.0.0",
+        "version": "0.2.0.0",
         "targetAbi": "10.11.0.0",
         "changelog": "Initial release.",
         "timestamp": "2026-08-30T04:01:27Z",
