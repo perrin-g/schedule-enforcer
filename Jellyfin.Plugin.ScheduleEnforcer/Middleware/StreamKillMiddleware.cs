@@ -48,8 +48,27 @@ public class StreamKillMiddleware
             return;
         }
 
+        // Refresh the owner entry's last-seen stamp on every matched request so a long playback is
+        // never aged out of the registry mid-stream. Transcode/HLS re-enters here once per
+        // segment; DirectPlay may never re-enter, and is covered instead by the registry refusing
+        // to prune an entry that still has a live tracked request (see PruneOlderThan).
+        _registry.TouchPlaySession(playSessionId, DateTimeOffset.UtcNow);
+
         var trackingId = Guid.NewGuid();
         _registry.TrackActiveRequest(playSessionId, trackingId, context.Abort);
+
+        // Re-check after tracking: a kill landing in the gap between the check above and this
+        // registration would otherwise leave the request neither rejected (checked too early) nor
+        // swept (tracked too late). For DirectPlay, where one request can be the entire stream,
+        // that would defeat the kill outright.
+        if (_registry.IsPlaySessionKilled(playSessionId))
+        {
+            _registry.UntrackActiveRequest(playSessionId, trackingId);
+            _logger.LogWarning("ScheduleEnforcer: rejecting stream request for PlaySessionId {PlaySessionId} killed during tracking", playSessionId);
+            context.Abort();
+            return;
+        }
+
         try
         {
             await _next(context).ConfigureAwait(false);

@@ -30,9 +30,27 @@ public class StreamKillRegistry : IStreamKillRegistry
         _logger = logger;
     }
 
+    // Diagnostic only, deliberately NOT on IStreamKillRegistry: nothing in the plugin's runtime
+    // path reads it. It exists so the unbounded-growth guarantee in the plan's global constraints
+    // is actually assertable -- an emptied-but-retained _active bucket has no other observable
+    // effect, which is exactly why the leak went unnoticed.
+    public int ActiveBucketCount => _active.Count;
+
     public void RecordPlaySessionOwner(string playSessionId, Guid userId, DateTimeOffset nowUtc)
     {
         _owners[playSessionId] = new OwnerEntry { UserId = userId, LastSeenUtc = nowUtc };
+    }
+
+    public void TouchPlaySession(string playSessionId, DateTimeOffset nowUtc)
+    {
+        // Re-stamping on use is what makes the 2-hour prune cutoff mean "2 hours since we last
+        // saw this playback" (matching SessionEnforcementState's semantics) rather than "2 hours
+        // since playback started" -- the latter silently un-enforced any movie longer than the
+        // cutoff, because the owner entry and its abort handle were pruned mid-stream.
+        if (_owners.TryGetValue(playSessionId, out var entry))
+        {
+            entry.LastSeenUtc = nowUtc;
+        }
     }
 
     public bool TryGetOwner(string playSessionId, out Guid userId)
@@ -90,6 +108,11 @@ public class StreamKillRegistry : IStreamKillRegistry
         }
     }
 
+    public void ClearUser(Guid userId)
+    {
+        _killedUsers.TryRemove(userId, out _);
+    }
+
     public bool IsPlaySessionKilled(string playSessionId) =>
         _owners.TryGetValue(playSessionId, out var entry) && _killedUsers.ContainsKey(entry.UserId);
 
@@ -97,7 +120,25 @@ public class StreamKillRegistry : IStreamKillRegistry
     {
         foreach (var kvp in _owners.Where(kvp => kvp.Value.LastSeenUtc < cutoffUtc).ToList())
         {
+            // Never evict an entry that still has a live tracked request. A DirectPlay stream can
+            // be a single HTTP request lasting the whole movie, so it never re-enters the
+            // streaming middleware to be re-stamped by TouchPlaySession -- pruning it would drop
+            // both the ownership mapping and the abort handle, silently un-enforcing that stream.
+            if (HasLiveRequests(kvp.Key))
+            {
+                continue;
+            }
+
             _owners.TryRemove(kvp.Key, out _);
+            _active.TryRemove(kvp.Key, out _);
+        }
+
+        // _active buckets are created for EVERY streaming request carrying a playSessionId, owned
+        // or not (auth resolution failed, the client skipped PlaybackInfo, the mapping predates a
+        // restart). UntrackActiveRequest empties the inner dictionary but leaves the outer key
+        // behind, so without this sweep those keys accumulate forever.
+        foreach (var kvp in _active.Where(kvp => kvp.Value.IsEmpty && !_owners.ContainsKey(kvp.Key)).ToList())
+        {
             _active.TryRemove(kvp.Key, out _);
         }
 
@@ -106,4 +147,7 @@ public class StreamKillRegistry : IStreamKillRegistry
             _killedUsers.TryRemove(kvp.Key, out _);
         }
     }
+
+    private bool HasLiveRequests(string playSessionId) =>
+        _active.TryGetValue(playSessionId, out var bucket) && !bucket.IsEmpty;
 }
