@@ -15,13 +15,8 @@ closes that gap.
   seconds later) and sends `Stop` to any session that supports media control.
 - **Works on paused sessions too** — enforcement isn't gated on whether the client currently
   reports something playing, so a session paused right at the cutoff still gets revoked.
-- **Kills the already-open stream, not just the token** — token revoke alone doesn't stop bytes
-  already in flight: transcoded/HLS segments already buffered play through regardless, and
-  DirectPlay's data channel carries no auth token at all, so revoke has *zero* effect on it. At
-  the same cutoff moment the token is revoked, this plugin also aborts the live connection
-  (Kestrel `HttpContext.Abort()`, a real TCP reset) and rejects any reconnect attempt using the
-  same play session — for both Transcode/HLS and DirectPlay. See
-  [Guaranteed stream kill](#guaranteed-stream-kill) below.
+- **Kills the already-open stream, not just the token** — a real TCP reset on the connection
+  itself, not just a revoked token. See [Guaranteed stream kill](#guaranteed-stream-kill) below.
 - **Admins are never enforced**, unconditionally.
 - **Read-only against schedules** — it doesn't create or manage Access Schedules itself; set
   those up as normal under Dashboard → Users → *user* → Access Schedule, and this plugin enforces
@@ -50,42 +45,18 @@ configured:
 
 ## Guaranteed stream kill
 
-Token revoke and `Stop` (see [How it works](#how-it-works) above) correctly block *starting* new
-playback, but neither one reliably stops a stream that's already open at cutoff:
+Token revoke and `Stop` (see [How it works](#how-it-works) above) block *starting* new playback,
+but neither reliably stops a stream that's already open at cutoff — Transcode/HLS plays through
+already-buffered segments, DirectPlay's data channel carries no auth token at all so revoke has
+zero effect on it, and `Stop` is advisory, not enforced.
 
-- **Transcode/HLS** streams fetch data as a sequence of short-lived, separately-authenticated
-  segment requests, so revoke *eventually* blocks the next segment — but not instantly, and a
-  client with several segments already buffered plays through them regardless.
-- **DirectPlay** is worse: its data requests (`?static=true&...`) carry **no auth token at all**.
-  They're authorized purely by `playSessionId` matching an open playback session, entirely
-  decoupled from the user's access token — so revoking the token has *zero* effect on an
-  in-progress DirectPlay stream.
-- `Stop` is a WebSocket message asking the client to stop. It's advisory, not enforced — nothing
-  obliges a client to honor it, or to honor it promptly.
-
-To close this gap, the plugin also registers two ASP.NET Core middleware components directly into
-Jellyfin's own request pipeline (via `IStartupFilter`, the same mechanism demonstrated by
-[jellyfin-plugin-dedupe-continue-watching](https://github.com/SloMR/jellyfin-plugin-dedupe-continue-watching)
-— see [Credits](#credits)):
-
-1. One intercepts `POST`/`GET /Items/{id}/PlaybackInfo` — the point in Jellyfin's request
-   lifecycle where a real, authenticated `UserId` and a freshly-minted `PlaySessionId` are both
-   present together — and records the `playSessionId → UserId` mapping.
-2. The other sits in front of the `/videos/` and `/audio/` streaming routes. On every matching
-   request it checks the `playSessionId` query parameter against that mapping and, if the owning
-   user has been killed, aborts the connection outright (`HttpContext.Abort()` — a real TCP reset,
-   not a request) — and keeps rejecting every subsequent request with that same `playSessionId`,
-   not just whatever was in flight at the moment of the kill, so a client can't just silently
-   reconnect.
-
-At the same tick `ScheduleEnforcerTask` revokes a user's tokens, it also calls this kill switch —
-so a session already playing at cutoff is aborted the same way, for both Transcode/HLS and
-DirectPlay, instead of playing on regardless.
-
-**Status:** implemented and code-reviewed (unit tests cover the pure state-tracking registry;
-the middleware itself is deliberately not unit tested — real `HttpContext`/ASP.NET pipeline
-behavior isn't meaningfully mockable, so it's verified against a live server instead). Not yet
-deployed or live-verified as of this writing.
+To close that gap, the plugin also hooks Jellyfin's ASP.NET Core request pipeline directly (via
+`IStartupFilter`, precedent: [jellyfin-plugin-dedupe-continue-watching](https://github.com/SloMR/jellyfin-plugin-dedupe-continue-watching))
+to map each play session to its user, then abort and reject any further requests for that session
+the moment its user is enforced — real TCP resets (`HttpContext.Abort()`), not advisory messages,
+covering both Transcode/HLS and DirectPlay. Confirmed live 2026-09-03 against a real DirectPlay
+session: stream killed, an unrelated admin's Transcode session unaffected, reconnect rejected,
+restart blocked by the still-closed schedule window.
 
 ## Build, test, deploy
 

@@ -7,6 +7,6 @@
   "overview": "Actively enforces Jellyfin access schedules instead of only gating new logins.",
   "owner": "perrin-g",
   "targetAbi": "10.11.0.0",
-  "timestamp": "2026-08-30T04:01:27Z",
+  "timestamp": "2026-09-03T06:48:10Z",
   "version": "0.2.0.0"
 }
