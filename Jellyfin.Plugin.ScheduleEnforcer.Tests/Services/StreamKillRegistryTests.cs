@@ -150,6 +150,137 @@ public class StreamKillRegistryTests
     }
 
     [Fact]
+    public void TouchPlaySession_RefreshesLastSeen_SoLongPlaybackIsNotPrunedMidStream()
+    {
+        // A Transcode/HLS stream re-enters the streaming middleware once per segment. Without the
+        // refresh, the owner entry aged out 2 hours after playback STARTED and enforcement
+        // silently stopped working for any long movie.
+        var registry = new StreamKillRegistry(Mock.Of<Microsoft.Extensions.Logging.ILogger<StreamKillRegistry>>());
+        registry.RecordPlaySessionOwner(PlaySessionId, UserId, Now);
+
+        registry.TouchPlaySession(PlaySessionId, Now.AddHours(3));
+        registry.PruneOlderThan(Now.AddHours(1));
+
+        Assert.True(registry.TryGetOwner(PlaySessionId, out var userId));
+        Assert.Equal(UserId, userId);
+    }
+
+    [Fact]
+    public void TouchPlaySession_UnknownPlaySessionId_IsANoOp()
+    {
+        var registry = new StreamKillRegistry(Mock.Of<Microsoft.Extensions.Logging.ILogger<StreamKillRegistry>>());
+
+        var exception = Record.Exception(() => registry.TouchPlaySession("never-seen", Now));
+
+        Assert.Null(exception);
+        Assert.False(registry.TryGetOwner("never-seen", out _));
+    }
+
+    [Fact]
+    public void PruneOlderThan_EntryWithLiveTrackedRequest_IsKeptEvenPastCutoff()
+    {
+        // DirectPlay can be a single HTTP request lasting the whole movie, so it never re-enters
+        // the middleware to be re-stamped. Pruning it would drop both the ownership mapping and
+        // the abort handle -- a later kill would then find nothing to abort.
+        var registry = new StreamKillRegistry(Mock.Of<Microsoft.Extensions.Logging.ILogger<StreamKillRegistry>>());
+        registry.RecordPlaySessionOwner(PlaySessionId, UserId, Now);
+        var aborted = false;
+        registry.TrackActiveRequest(PlaySessionId, Guid.NewGuid(), () => aborted = true);
+
+        registry.PruneOlderThan(Now.AddHours(3));
+
+        Assert.True(registry.TryGetOwner(PlaySessionId, out _));
+
+        // ...and the abort handle survived too, so a kill arriving after the prune still works.
+        registry.KillUser(UserId, Now.AddHours(3));
+        Assert.True(aborted);
+        Assert.True(registry.IsPlaySessionKilled(PlaySessionId));
+    }
+
+    [Fact]
+    public void PruneOlderThan_EntryWithNoLiveTrackedRequest_IsStillPrunedPastCutoff()
+    {
+        // The counterpart to the test above: once the tracked request finishes, the stale entry
+        // must go, or nothing ever ages out.
+        var registry = new StreamKillRegistry(Mock.Of<Microsoft.Extensions.Logging.ILogger<StreamKillRegistry>>());
+        registry.RecordPlaySessionOwner(PlaySessionId, UserId, Now);
+        var trackingId = Guid.NewGuid();
+        registry.TrackActiveRequest(PlaySessionId, trackingId, () => { });
+        registry.UntrackActiveRequest(PlaySessionId, trackingId);
+
+        registry.PruneOlderThan(Now.AddHours(3));
+
+        Assert.False(registry.TryGetOwner(PlaySessionId, out _));
+    }
+
+    [Fact]
+    public void PruneOlderThan_SweepsFinishedActiveEntriesThatNeverGotAnOwner()
+    {
+        // TrackActiveRequest creates a bucket for EVERY streaming request carrying a
+        // playSessionId, mapped or not. UntrackActiveRequest empties the inner dictionary but
+        // leaves the outer key, so without a sweep those keys grow without bound.
+        var registry = new StreamKillRegistry(Mock.Of<Microsoft.Extensions.Logging.ILogger<StreamKillRegistry>>());
+        const string UnmappedPlaySessionId = "unmapped-session";
+        var trackingId = Guid.NewGuid();
+        registry.TrackActiveRequest(UnmappedPlaySessionId, trackingId, () => { });
+        registry.UntrackActiveRequest(UnmappedPlaySessionId, trackingId);
+
+        registry.PruneOlderThan(Now.AddHours(3));
+
+        Assert.Equal(0, registry.ActiveBucketCount);
+    }
+
+    [Fact]
+    public void PruneOlderThan_DoesNotSweepAnUnownedActiveEntryThatIsStillInFlight()
+    {
+        // An in-flight request whose owner mapping was never recorded (auth resolution failed,
+        // or the mapping predates a restart) must not have its abort handle swept out from under
+        // it mid-request.
+        var registry = new StreamKillRegistry(Mock.Of<Microsoft.Extensions.Logging.ILogger<StreamKillRegistry>>());
+        const string UnmappedPlaySessionId = "unmapped-session";
+        registry.TrackActiveRequest(UnmappedPlaySessionId, Guid.NewGuid(), () => { });
+
+        registry.PruneOlderThan(Now.AddHours(3));
+
+        Assert.Equal(1, registry.ActiveBucketCount);
+    }
+
+    [Fact]
+    public void ClearUser_RemovesTheKill_SoALaterLegitimateSessionIsNotBlocked()
+    {
+        // A user with a second AccessSchedule window opening within the prune cutoff of the first
+        // window's end would otherwise still be marked killed, and their legitimately permitted
+        // playback would be killed on sight.
+        var registry = new StreamKillRegistry(Mock.Of<Microsoft.Extensions.Logging.ILogger<StreamKillRegistry>>());
+        registry.RecordPlaySessionOwner(PlaySessionId, UserId, Now);
+        registry.KillUser(UserId, Now);
+        Assert.True(registry.IsPlaySessionKilled(PlaySessionId));
+
+        registry.ClearUser(UserId);
+
+        // A brand-new playback attempt inside the new window is not blocked...
+        const string NewPlaySessionId = "session-2";
+        registry.RecordPlaySessionOwner(NewPlaySessionId, UserId, Now.AddMinutes(30));
+        Assert.False(registry.IsPlaySessionKilled(NewPlaySessionId));
+
+        // ...and neither is the pre-existing mapping.
+        Assert.False(registry.IsPlaySessionKilled(PlaySessionId));
+    }
+
+    [Fact]
+    public void ClearUser_DoesNotClearADifferentUsersKill()
+    {
+        var registry = new StreamKillRegistry(Mock.Of<Microsoft.Extensions.Logging.ILogger<StreamKillRegistry>>());
+        var otherUserId = Guid.NewGuid();
+        registry.RecordPlaySessionOwner(PlaySessionId, UserId, Now);
+        registry.KillUser(UserId, Now);
+
+        registry.ClearUser(otherUserId);
+
+        Assert.True(registry.IsPlaySessionKilled(PlaySessionId));
+    }
+
+    [Fact]
     public void PruneOlderThan_RemovesStaleKillEntry()
     {
         // Verify that kill entries age out and are pruned, allowing the user to be killed again later.
