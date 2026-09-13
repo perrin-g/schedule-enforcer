@@ -72,7 +72,7 @@ restart blocked by the still-closed schedule window.
 
 ## Development & Contributing
 
-The plugin is written in C# / .NET 9 and compiled against Jellyfin 10.11.x APIs. `dotnet build`
+The plugin is written in C# / .NET 10 and compiled against Jellyfin 12.0.x APIs. `dotnet build`
 and `dotnet test` work as expected; `scripts/sync-version.sh` keeps the csproj's `<Version>` in
 sync with `meta.json`/`manifest.json` after a bump. See the repository for the full build/deploy
 and release process.
