@@ -117,6 +117,24 @@ Upgrading later is the same steps with the new version's zip in its own new
 `ScheduleEnforcer_<version>` folder — Jellyfin does not require the old version's folder to be
 removed first, but it's fine to delete it once the new version is confirmed working.
 
+## Timezone
+
+Schedule windows are evaluated against the timezone Jellyfin's own container is running with —
+the plugin has no way to read a separate "server timezone" from Jellyfin, since Jellyfin doesn't
+expose one. Most Docker images default to UTC unless you set it explicitly. If your container's
+`TZ` isn't set to your actual local timezone, cutoffs will fire at the wrong local time — add it
+to your Jellyfin container's environment, e.g. `-e TZ=Pacific/Auckland` (or the equivalent
+`environment:` entry in docker-compose), then restart.
+
+Confirm it's correct in the logs after any (re)start:
+
+```bash
+docker logs jellyfin --since 2m | grep -i ScheduleEnforcer
+```
+
+Expect `ScheduleEnforcer: resolved container timezone is <Your/Timezone>`. If that reads `UTC`
+and you expected otherwise, fix `TZ` and restart — don't wait for a wrong cutoff to notice.
+
 ## If the plugin seems to stop working after a restart
 
 Check this first. If it crashes during Jellyfin's second (host-side) DI-activation attempt on
@@ -132,7 +150,7 @@ Recovery is an explicit re-enable, via Dashboard → Plugins, or:
 
 ```bash
 VERSION=$(jq -r .version meta.json)
-ssh <user>@<jellyfin-host> "API_KEY=\$(sqlite3 -readonly <jellyfin-db-path> 'SELECT AccessToken FROM ApiKeys WHERE Name=\"<an-existing-key-name>\"') && curl -s -X POST 'http://localhost:8096/Plugins/5c90bb47-9d60-4b70-9265-3f2d025fcdd8/${VERSION}/Enable' -H \"X-Emby-Token: \$API_KEY\""
+ssh <user>@<jellyfin-host> "API_KEY=\$(sqlite3 -readonly <jellyfin-db-path> 'SELECT AccessToken FROM ApiKeys WHERE Name=\"<an-existing-key-name>\"') && curl -s -X POST 'http://localhost:8096/Plugins/5c90bb47-9d60-4b70-9265-3f2d025fcdd8/${VERSION}/Enable' -H \"Authorization: MediaBrowser Token=\\\"\$API_KEY\\\"\""
 ssh <user>@<jellyfin-host> "docker restart jellyfin"
 ```
 
